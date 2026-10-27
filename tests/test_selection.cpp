@@ -73,3 +73,12 @@ TEST(selection_magnifier_flips_at_edges) {
     CHECK(br.right <= 1900 - 20 + 0.01f);
     CHECK(br.bottom <= 1060 - 20 + 0.01f);
 }
+
+TEST(selection_popup_placement) {
+    const Rect screen{0, 0, 1000, 800};
+    CHECK((placePopup({100, 100, 134, 134}, 200, 150, screen, 4) == Rect{100, 138, 300, 288}));
+    CHECK(placePopup({100, 700, 134, 734}, 200, 150, screen, 4).bottom == 696);  // flips above
+    CHECK(placePopup({950, 100, 984, 134}, 200, 150, screen, 4).right == 1000);  // clamped right
+    const Rect tall = placePopup({0, 300, 10, 310}, 50, 900, screen, 4);         // taller than screen
+    CHECK(tall.top == 0);
+}

@@ -20,6 +20,15 @@ inline constexpr int kEndShapeCount = 6;
 
 enum class ListStyle { None, Bullet, Numbered };
 enum class MosaicMode { Pixelate, Blur };
+// Material: plain ink, or frosted glass (blurred backdrop with a soft rim).
+enum class Material { Solid, Frosted };
+inline constexpr int kListStyleCount = 3;
+
+// Option names for menus and tooltips.
+const wchar_t* finishName(LineFinish f);
+const wchar_t* endShapeName(EndShape e);
+const wchar_t* listStyleName(ListStyle l);
+const wchar_t* mosaicModeName(MosaicMode m);
 
 inline constexpr int kFontCount = 5;
 const wchar_t* fontFamily(int index);  // DirectWrite family name, index clamped
@@ -54,6 +63,7 @@ struct Shape {
     TextStyle textStyle;
     Vec2 textSize;              // measured label extent, filled in by the renderer
     MosaicMode mosaic = MosaicMode::Pixelate;
+    Material material = Material::Solid;
 };
 
 // Defaults per kind (Arrow/MLeader get a triangle head, everything else none).
@@ -89,7 +99,12 @@ struct EndCap {
     float radius = 0.0f;        // Dot
     Vec2 shaftEnd;
 };
-EndCap makeEndCap(EndShape shape, Vec2 from, Vec2 tip, float strokeWidth);
+// Frosted dots grow into a lens so the blurred disc reads as a highlight.
+EndCap makeEndCap(EndShape shape, Vec2 from, Vec2 tip, float strokeWidth, Material material = Material::Solid);
+
+// Text editing keys (WM_CHAR): Enter breaks the line, Ctrl+Enter (LF) finishes.
+enum class TextKey { Ignore, Insert, Newline, Backspace, Commit };
+TextKey classifyTextChar(wchar_t c, bool ctrl);
 
 // Acute inclination of a segment against the horizontal, in degrees [0, 90].
 float inclinationDeg(Vec2 a, Vec2 b);

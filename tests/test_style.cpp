@@ -1,3 +1,6 @@
+#include <string>
+#include <vector>
+
 #include "boringshot/annotation.h"
 #include "bstest.h"
 
@@ -116,4 +119,35 @@ TEST(mosaic_is_box_shaped) {
     m.b = {20, 30};
     CHECK(isMeaningful(m));
     CHECK((constrainDrag(ShapeKind::Mosaic, {0, 0}, {20, 5}, true) == Vec2{20, 20}));
+}
+
+TEST(style_option_names_unique) {
+    std::vector<std::wstring> names;
+    for (int i = 0; i < kLineFinishCount; ++i) names.push_back(finishName(static_cast<LineFinish>(i)));
+    for (int i = 0; i < kEndShapeCount; ++i) names.push_back(endShapeName(static_cast<EndShape>(i)));
+    for (int i = 0; i < kListStyleCount; ++i) names.push_back(listStyleName(static_cast<ListStyle>(i)));
+    names.push_back(mosaicModeName(MosaicMode::Pixelate));
+    names.push_back(mosaicModeName(MosaicMode::Blur));
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        CHECK(!names[i].empty() && names[i] != L"?");
+        for (std::size_t j = i + 1; j < names.size(); ++j) CHECK(names[i] != names[j]);
+    }
+}
+
+TEST(style_frosted_dot_is_a_lens) {
+    const auto solid = makeEndCap(EndShape::Dot, {0, 0}, {50, 0}, 3);
+    const auto glass = makeEndCap(EndShape::Dot, {0, 0}, {50, 0}, 3, Material::Frosted);
+    CHECK(glass.radius > solid.radius * 1.8f);
+    CHECK((glass.center == Vec2{50, 0}));
+    CHECK(makeShape(ShapeKind::MLeader).material == Material::Solid);
+}
+
+TEST(text_keys_enter_breaks_line) {
+    CHECK(classifyTextChar(L'\r', false) == TextKey::Newline);   // plain Enter
+    CHECK(classifyTextChar(L'\n', true) == TextKey::Commit);     // Ctrl+Enter → LF
+    CHECK(classifyTextChar(L'\r', true) == TextKey::Commit);
+    CHECK(classifyTextChar(L'\b', false) == TextKey::Backspace);
+    CHECK(classifyTextChar(26, true) == TextKey::Ignore);        // Ctrl+Z
+    CHECK(classifyTextChar(L'中', false) == TextKey::Insert);
+    CHECK(classifyTextChar(L' ', false) == TextKey::Insert);
 }

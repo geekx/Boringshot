@@ -61,3 +61,54 @@ TEST(config_hex_color) {
     CHECK(!parseHexColor(L"#00FF8", r, g, b));
     CHECK(!parseHexColor(L"#GG0000", r, g, b));
 }
+
+TEST(config_serialize_roundtrip) {
+    Config c;
+    c.capture = {kModCtrl | kModShift, 'X'};
+    c.captureAlt = {};
+    c.backend = CaptureBackend::Wgc;
+    c.animation = false;
+    c.watermarkProfile.text = L"内部评审 {user}; 勿外传";
+    c.watermarkProfile.fontFamily = L"KaiTi";
+    c.watermarkProfile.fontSize = 22.5f;
+    c.watermarkProfile.colorR = 0.86f;
+    c.watermarkProfile.colorG = 0.15f;
+    c.watermarkProfile.colorB = 0.15f;
+    c.watermarkProfile.opacity = 0.3f;
+    c.watermarkProfile.rotationDeg = -45;
+    c.watermarkProfile.tileSpacingX = 420;
+    c.watermarkProfile.tileSpacingY = 240;
+    c.watermarkProfile.enableOnAllMonitors = false;
+    const Config r = parseConfig(serializeConfig(c));
+    CHECK(r.warnings.empty());
+    CHECK(r.capture == c.capture && !r.captureAlt.enabled() && r.watermark == c.watermark);
+    CHECK(r.backend == CaptureBackend::Wgc && !r.animation);
+    CHECK(r.watermarkProfile.text == c.watermarkProfile.text);
+    CHECK(r.watermarkProfile.fontFamily == L"KaiTi");
+    CHECK_NEAR(r.watermarkProfile.fontSize, 22.5, 1e-4);
+    CHECK_NEAR(r.watermarkProfile.opacity, 0.3, 1e-4);
+    CHECK_NEAR(r.watermarkProfile.rotationDeg, -45, 1e-4);
+    CHECK(!r.watermarkProfile.enableOnAllMonitors);
+    CHECK(colorPresetIndex(r.watermarkProfile.colorR, r.watermarkProfile.colorG, r.watermarkProfile.colorB) == 1);
+    CHECK(spacingPresetIndex(r.watermarkProfile.tileSpacingX, r.watermarkProfile.tileSpacingY) == 2);
+}
+
+TEST(config_hotkey_control_mapping) {
+    // HOTKEYF_SHIFT=1, CONTROL=2, ALT=4 in the high byte.
+    CHECK((hotkeyFromControl((0x2u | 0x4u) << 8 | 'A') == Hotkey{kModCtrl | kModAlt, 'A'}));
+    CHECK((hotkeyFromControl(0x1u << 8 | 0x70) == Hotkey{kModShift, 0x70}));
+    CHECK(!hotkeyFromControl(0x2u << 8).enabled());  // modifiers alone = nothing
+    CHECK(hotkeyFromControl(0x2u << 8).modifiers == 0);
+    for (const Hotkey h : {Hotkey{kModCtrl | kModAlt, 'A'}, Hotkey{kModShift, 0x2C}, Hotkey{0, 0x70}, Hotkey{}})
+        CHECK((hotkeyFromControl(hotkeyToControl(h)) == h));
+}
+
+TEST(config_presets) {
+    CHECK(colorPresetIndex(128 / 255.0f, 128 / 255.0f, 128 / 255.0f) == 0);
+    CHECK(colorPresetIndex(0.3f, 0.7f, 0.1f) == -1);
+    CHECK(spacingPresetIndex(320, 180) == 1);
+    CHECK(spacingPresetIndex(321, 180) == -1);
+    const Config d;
+    CHECK(spacingPresetIndex(d.watermarkProfile.tileSpacingX, d.watermarkProfile.tileSpacingY) == 1);
+    CHECK(colorPresetIndex(d.watermarkProfile.colorR, d.watermarkProfile.colorG, d.watermarkProfile.colorB) == 0);
+}

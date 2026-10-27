@@ -84,6 +84,14 @@ Rect placeToolbar(const Rect& sel, float w, float h, const Rect& screen, float g
     return {x, y, x + w, y + h};
 }
 
+Rect placePopup(const Rect& a, float w, float h, const Rect& screen, float gap) {
+    const float x = std::clamp(a.left, screen.left, std::max(screen.left, screen.right - w));
+    float y = a.bottom + gap;
+    if (y + h > screen.bottom && a.top - gap - h >= screen.top) y = a.top - gap - h;
+    y = std::clamp(y, screen.top, std::max(screen.top, screen.bottom - h));
+    return {x, y, x + w, y + h};
+}
+
 Rect placeNearCursor(Vec2 c, float w, float h, const Rect& screen, float off) {
     float x = c.x + off;
     float y = c.y + off;

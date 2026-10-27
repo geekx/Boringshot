@@ -194,6 +194,75 @@ Config parseConfig(const std::wstring& text) {
     return cfg;
 }
 
+namespace {
+
+std::wstring num(float v) {
+    wchar_t buf[32];
+    std::swprintf(buf, 32, L"%g", static_cast<double>(v));
+    return buf;
+}
+
+std::wstring hex(float r, float g, float b) {
+    const auto c = [](float v) { return static_cast<unsigned>(v * 255.0f + 0.5f) & 0xFFu; };
+    wchar_t buf[16];
+    std::swprintf(buf, 16, L"#%02X%02X%02X", c(r), c(g), c(b));
+    return buf;
+}
+
+bool near(float a, float b) { return a - b < 0.6f / 255.0f && b - a < 0.6f / 255.0f; }
+
+}  // namespace
+
+std::wstring serializeConfig(const Config& c) {
+    const auto& w = c.watermarkProfile;
+    const wchar_t* backend = c.backend == CaptureBackend::Wgc ? L"wgc" : c.backend == CaptureBackend::Gdi ? L"gdi" : L"auto";
+    return L"[hotkeys]\ncapture = " + formatHotkey(c.capture) + L"\ncapture_alt = " + formatHotkey(c.captureAlt) +
+           L"\nwatermark = " + formatHotkey(c.watermark) + L"\n[capture]\nbackend = " + backend +
+           L"\nanimation = " + (c.animation ? L"true" : L"false") + L"\n[watermark]\ntext = " + w.text +
+           L"\nfont = " + w.fontFamily + L"\nsize = " + num(w.fontSize) + L"\ncolor = " + hex(w.colorR, w.colorG, w.colorB) +
+           L"\nopacity = " + num(w.opacity) + L"\nangle = " + num(w.rotationDeg) + L"\nspacing_x = " +
+           num(w.tileSpacingX) + L"\nspacing_y = " + num(w.tileSpacingY) + L"\nall_monitors = " +
+           (w.enableOnAllMonitors ? L"true" : L"false") + L"\n";
+}
+
+Hotkey hotkeyFromControl(unsigned value) {
+    Hotkey h;
+    h.vk = value & 0xFFu;
+    const unsigned f = (value >> 8) & 0xFFu;
+    if (f & 0x1) h.modifiers |= kModShift;
+    if (f & 0x2) h.modifiers |= kModCtrl;
+    if (f & 0x4) h.modifiers |= kModAlt;
+    if (h.vk == 0) h.modifiers = 0;
+    return h;
+}
+
+unsigned hotkeyToControl(const Hotkey& h) {
+    if (!h.enabled()) return 0;
+    unsigned f = 0;
+    if (h.modifiers & kModShift) f |= 0x1;
+    if (h.modifiers & kModCtrl) f |= 0x2;
+    if (h.modifiers & kModAlt) f |= 0x4;
+    return (f << 8) | (h.vk & 0xFFu);
+}
+
+int colorPresetIndex(float r, float g, float b) {
+    int i = 0;
+    for (const auto& p : kWatermarkColors) {
+        if (near(p.r, r) && near(p.g, g) && near(p.b, b)) return i;
+        ++i;
+    }
+    return -1;
+}
+
+int spacingPresetIndex(float x, float y) {
+    int i = 0;
+    for (const auto& p : kWatermarkSpacings) {
+        if (p.x == x && p.y == y) return i;
+        ++i;
+    }
+    return -1;
+}
+
 std::wstring defaultConfigText() {
     return L"; Boringshot 设置 — 保存后自动生效\n"
            L"[hotkeys]\n"

@@ -64,6 +64,49 @@ bool stripBullet(std::wstring& line) {
 
 }  // namespace
 
+const wchar_t* finishName(LineFinish f) {
+    switch (f) {
+        case LineFinish::Solid: return L"实线";
+        case LineFinish::Dashed: return L"虚线";
+        case LineFinish::Dotted: return L"点线";
+        case LineFinish::DashDot: return L"点划线";
+    }
+    return L"?";
+}
+
+const wchar_t* endShapeName(EndShape e) {
+    switch (e) {
+        case EndShape::None: return L"无";
+        case EndShape::Triangle: return L"实心箭头";
+        case EndShape::OpenArrow: return L"开放箭头";
+        case EndShape::Dot: return L"圆点";
+        case EndShape::Tick: return L"建筑斜刻度";
+        case EndShape::Square: return L"方块";
+    }
+    return L"?";
+}
+
+const wchar_t* listStyleName(ListStyle l) {
+    switch (l) {
+        case ListStyle::None: return L"无列表";
+        case ListStyle::Bullet: return L"圆点列表 •";
+        case ListStyle::Numbered: return L"编号列表 1. 2. 3.";
+    }
+    return L"?";
+}
+
+const wchar_t* mosaicModeName(MosaicMode m) {
+    return m == MosaicMode::Pixelate ? L"像素马赛克" : L"毛玻璃模糊";
+}
+
+TextKey classifyTextChar(wchar_t c, bool ctrl) {
+    if (c == L'\b') return TextKey::Backspace;
+    if (c == L'\n') return TextKey::Commit;  // Ctrl+Enter arrives as LF
+    if (c == L'\r') return ctrl ? TextKey::Commit : TextKey::Newline;
+    if (c < 32) return TextKey::Ignore;       // other Ctrl+letter chords
+    return TextKey::Insert;
+}
+
 const wchar_t* fontFamily(int index) { return kFontFamilies[clampFont(index)]; }
 const wchar_t* fontLabel(int index) { return kFontLabels[clampFont(index)]; }
 
@@ -155,7 +198,7 @@ MLeaderLayout leaderLayout(const Shape& s) {
     return layoutMLeader(in, leaderGeometryFor(s));
 }
 
-EndCap makeEndCap(EndShape shape, Vec2 from, Vec2 tip, float w) {
+EndCap makeEndCap(EndShape shape, Vec2 from, Vec2 tip, float w, Material material) {
     EndCap cap;
     cap.shape = shape;
     cap.shaftEnd = tip;
@@ -182,7 +225,7 @@ EndCap makeEndCap(EndShape shape, Vec2 from, Vec2 tip, float w) {
         }
         case EndShape::Dot:
             cap.center = tip;
-            cap.radius = 1.2f * w + 3.0f;
+            cap.radius = material == Material::Frosted ? 2.6f * w + 8.0f : 1.2f * w + 3.0f;
             cap.filled = true;
             break;
         case EndShape::Tick: {  // CAD architectural tick: oblique stroke across the end

@@ -33,6 +33,10 @@ Rect dragHandle(const Rect& start, Handle handle, Vec2 delta, const Rect& bounds
 Rect placeToolbar(const Rect& selection, float width, float height, const Rect& screen,
                   float gap);
 
+// Dropdown / tooltip: left-aligned under `anchor`, above it when there is no
+// room below, clamped horizontally to `screen`.
+Rect placePopup(const Rect& anchor, float width, float height, const Rect& screen, float gap);
+
 // Popup (magnifier) at bottom-right of the cursor, flipped on each axis when it
 // would leave `screen`.
 Rect placeNearCursor(Vec2 cursor, float width, float height, const Rect& screen, float offset);
