@@ -253,11 +253,12 @@ void smokeLog(const std::wstring& step) {
 // Non-zero = which step failed.
 int runSmoke(HINSTANCE instance) {
     smokeLog(L"icon");
-    HICON small = loadAppIcon(instance, SM_CXSMICON);
-    HICON large = loadAppIcon(instance, SM_CXICON);
-    const bool iconOk = small && large;
-    if (small) DestroyIcon(small);
-    if (large) DestroyIcon(large);
+    // Not `small`/`large`: rpcndr.h #defines `small` as char under MSVC.
+    HICON iconSm = loadAppIcon(instance, SM_CXSMICON);
+    HICON iconLg = loadAppIcon(instance, SM_CXICON);
+    const bool iconOk = iconSm && iconLg;
+    if (iconSm) DestroyIcon(iconSm);
+    if (iconLg) DestroyIcon(iconLg);
     if (!iconOk) return 11;
 
     smokeLog(L"settings");
