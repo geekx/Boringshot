@@ -36,6 +36,8 @@ struct Factories {
 
 // Lazily created; requires COM initialised on the calling (UI) thread.
 Factories& factories();
+// Releases the factories; call before CoUninitialize (a static destructor would run after it).
+void shutdown();
 
 inline D2D1_RECT_F toD2D(const bs::Rect& r) { return D2D1::RectF(r.left, r.top, r.right, r.bottom); }
 inline D2D1_POINT_2F toD2D(bs::Vec2 p) { return D2D1::Point2F(p.x, p.y); }

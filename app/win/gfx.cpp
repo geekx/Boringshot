@@ -38,18 +38,25 @@ bs::Vec2 mid(bs::Vec2 a, bs::Vec2 b) { return (a + b) * 0.5f; }
 
 }  // namespace
 
-Factories& factories() {
-    static Factories f = [] {
-        Factories r;
-        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, r.d2d.GetAddressOf());
-        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                            reinterpret_cast<IUnknown**>(r.dwrite.GetAddressOf()));
-        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                         IID_PPV_ARGS(r.wic.GetAddressOf()));
-        return r;
-    }();
+namespace {
+Factories& storage() {
+    static Factories f;
     return f;
 }
+}  // namespace
+
+Factories& factories() {
+    Factories& f = storage();
+    if (!f.d2d) {
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, f.d2d.GetAddressOf());
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                            reinterpret_cast<IUnknown**>(f.dwrite.GetAddressOf()));
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(f.wic.GetAddressOf()));
+    }
+    return f;
+}
+
+void shutdown() { storage() = Factories{}; }
 
 ComPtr<ID2D1Bitmap> makeBitmap(ID2D1RenderTarget* rt, const Image& img) {
     ComPtr<ID2D1Bitmap> bmp;

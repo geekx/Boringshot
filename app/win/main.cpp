@@ -6,6 +6,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwchar>
 #include <memory>
 #include <vector>
@@ -156,9 +157,19 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
+// Smoke progress goes to the inherited stderr (ctest pipe) so CI pinpoints a failing step.
+void smokeLog(const char* step) {
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    if (!err || err == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(err, step, static_cast<DWORD>(std::strlen(step)), &written, nullptr);
+    WriteFile(err, "\n", 1, &written, nullptr);
+}
+
 // --smoke: exercise every real platform path (capture, overlay UI, composite,
 // pin, watermark) without user input, then exit. Non-zero = which step failed.
 int runSmoke(HINSTANCE instance) {
+    smokeLog("smoke: watermark");
     WatermarkOverlay overlay;
     if (!overlay.create(instance)) return 2;
     bs::WatermarkProfile profile;
@@ -168,16 +179,19 @@ int runSmoke(HINSTANCE instance) {
     overlay.destroy();
     if (!watermarkOk) return 3;
 
+    smokeLog("smoke: grab");
     ScreenGrab grab = grabScreen();
     if (grab.image.empty() || grab.monitors.empty()) return 4;
     const float w = std::min(320.0f, static_cast<float>(grab.image.width));
     const float h = std::min(200.0f, static_cast<float>(grab.image.height));
+    smokeLog("smoke: capture window");
     CaptureWindow capture;
     if (!capture.open(instance, std::move(grab), {})) return 5;
     const bool captureOk = capture.smoke({0.0f, 0.0f, w, h});
     capture.close();
     if (!captureOk) return 6;
 
+    smokeLog("smoke: pin");
     gfx::Image img;
     img.width = 120;
     img.height = 80;
@@ -186,6 +200,7 @@ int runSmoke(HINSTANCE instance) {
     if (!pin.open(instance, img, {40, 40}, {})) return 7;
     const bool pinOk = pin.smoke();
     pin.close();
+    smokeLog(pinOk ? "smoke: ok" : "smoke: pin failed");
     return pinOk ? 0 : 8;
 }
 
@@ -197,6 +212,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     g_instance = instance;
     if (cmdLine && std::wcsstr(cmdLine, L"--smoke")) {
         const int rc = runSmoke(instance);
+        gfx::shutdown();
         CoUninitialize();
         return rc;
     }
@@ -235,6 +251,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     }
     g_capture.reset();
     g_pins.clear();
+    gfx::shutdown();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     CoUninitialize();
