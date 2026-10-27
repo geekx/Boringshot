@@ -18,6 +18,7 @@
    ```
    平台层（`app/win`）无法在 Linux 单测时，至少提供 `--smoke` 自检并在 Windows CI 中运行；
    提交前可用 mingw-w64 交叉编译做快速语法/链接检查（`CMAKE_SYSTEM_NAME=Windows`，CI 仍以 MSVC 为准）。
+   平台层别用 Windows SDK 的宏名当标识符：`small`、`hyper`、`near`、`far`、`min`/`max`、`interface` 等。
 2. **Action 编译安装包默认走 Release**：`.github/workflows/build.yml` 的 `build_type` 默认 `Release`；
    CMake 单配置生成器未指定时也默认 `Release`。
 3. **自带运行时**：MSVC 使用 `/MT` 静态 CRT（`CMAKE_MSVC_RUNTIME_LIBRARY`），用户无需安装 VC++ Redist。

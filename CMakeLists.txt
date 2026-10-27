@@ -86,6 +86,9 @@ if(WIN32)
     enable_language(RC)
     target_sources(boringshot PRIVATE app/win/boringshot_mingw.rc)
     target_link_options(boringshot PRIVATE -municode -static)
+    # Mirror the Windows SDK's <rpcndr.h> macros so MinGW catches names MSVC rejects
+    # (e.g. a variable called `small` becomes `char`).
+    target_compile_definitions(boringshot PRIVATE small=char hyper=__int64)
   endif()
   if(BORINGSHOT_BUILD_TESTS)
     # Platform self-check: watermark, screen grab, capture UI + composite, pin.
