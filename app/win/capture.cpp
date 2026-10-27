@@ -6,6 +6,9 @@
 #include <cwchar>
 
 #include "boringshot/selection.h"
+#ifdef BORINGSHOT_HAS_WGC
+#include "capture_wgc.h"
+#endif
 
 namespace {
 
@@ -55,17 +58,12 @@ BOOL CALLBACK onMonitor(HMONITOR, HDC, LPRECT r, LPARAM lp) {
 
 }  // namespace
 
-ScreenGrab grabScreen() {
-    ScreenGrab g;
-    RECT& v = g.virtualRect;
-    v.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    v.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    v.right = v.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    v.bottom = v.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+namespace {
+
+bool grabGdi(const RECT& v, gfx::Image& out) {
     const int w = v.right - v.left;
     const int h = v.bottom - v.top;
-    if (w <= 0 || h <= 0) return g;
-
+    bool ok = false;
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
     BITMAPINFO bmi{};
@@ -81,17 +79,41 @@ ScreenGrab grabScreen() {
         HGDIOBJ old = SelectObject(mem, dib);
         if (BitBlt(mem, 0, 0, w, h, screen, v.left, v.top, SRCCOPY | CAPTUREBLT)) {
             GdiFlush();
-            g.image.width = w;
-            g.image.height = h;
-            g.image.px.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
-            std::memcpy(g.image.px.data(), bits, g.image.px.size() * 4u);
-            for (auto& p : g.image.px) p |= 0xFF000000u;  // GDI leaves alpha undefined
+            out.width = w;
+            out.height = h;
+            out.px.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+            std::memcpy(out.px.data(), bits, out.px.size() * 4u);
+            for (auto& p : out.px) p |= 0xFF000000u;  // GDI leaves alpha undefined
+            ok = true;
         }
         SelectObject(mem, old);
     }
     if (dib) DeleteObject(dib);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+    return ok;
+}
+
+}  // namespace
+
+ScreenGrab grabScreen(bs::CaptureBackend backend) {
+    ScreenGrab g;
+    RECT& v = g.virtualRect;
+    v.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    v.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    v.right = v.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    v.bottom = v.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int w = v.right - v.left;
+    const int h = v.bottom - v.top;
+    if (w <= 0 || h <= 0) return g;
+
+#ifdef BORINGSHOT_HAS_WGC
+    const bool tryWgc = backend == bs::CaptureBackend::Wgc || (backend == bs::CaptureBackend::Auto && wgcBorderless());
+    if (tryWgc && grabWithWgc(v, g.image)) g.backend = L"wgc";
+#else
+    (void)backend;
+#endif
+    if (g.image.empty() && grabGdi(v, g.image)) g.backend = L"gdi";
 
     const bs::Rect bounds{0, 0, static_cast<float>(w), static_cast<float>(h)};
     EnumCtx wctx{v, bounds, &g.windows};

@@ -1,5 +1,5 @@
-// Boringshot resident host: single instance, tray icon, global hotkeys, the
-// capture overlay, pinned images and the click-through watermark (doc §12).
+// Boringshot resident host: single instance, tray icon, configurable global
+// hotkeys, the capture overlay, pinned images and the click-through watermark.
 
 #include <windows.h>
 #include <objbase.h>
@@ -9,11 +9,16 @@
 #include <cstring>
 #include <cwchar>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "capture_window.h"
 #include "pin_window.h"
+#include "settings.h"
 #include "watermark_overlay.h"
+#ifdef BORINGSHOT_HAS_WGC
+#include "capture_wgc.h"
+#endif
 
 namespace {
 
@@ -22,13 +27,15 @@ constexpr wchar_t kMutexName[] = L"Local\\Boringshot.SingleInstance";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kReapMessage = WM_APP + 2;  // delete closed capture/pin objects outside their wndProc
 constexpr UINT kTrayId = 1;
-constexpr int kHotkeyCapture = 1;       // F1
-constexpr int kHotkeyCaptureAlt = 2;    // Ctrl+Alt+A
-constexpr int kHotkeyWatermark = 3;     // Ctrl+Alt+W
+constexpr int kHotkeyCapture = 1;
+constexpr int kHotkeyCaptureAlt = 2;
+constexpr int kHotkeyWatermark = 3;
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT kClockIntervalMs = 15000;  // {time} has minute granularity
+constexpr UINT_PTR kConfigTimer = 2;
+constexpr UINT kConfigPollMs = 1500;      // config.ini edits apply on save
 
-enum : UINT { kCmdCapture = 100, kCmdToggleWatermark, kCmdClosePins, kCmdExit };
+enum : UINT { kCmdCapture = 100, kCmdToggleWatermark, kCmdClosePins, kCmdSettings, kCmdReload, kCmdExit };
 
 HINSTANCE g_instance = nullptr;
 HWND g_host = nullptr;
@@ -37,6 +44,9 @@ WatermarkOverlay g_overlay;
 std::unique_ptr<CaptureWindow> g_capture;
 bool g_captureClosed = false;
 std::vector<std::unique_ptr<PinWindow>> g_pins;
+std::wstring g_configPath;
+ULONGLONG g_configStamp = 0;
+bs::Config g_config;
 
 void addTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid{};
@@ -46,8 +56,10 @@ void addTrayIcon(HWND hwnd) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = kTrayMessage;
     nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(nid.szTip, L"Boringshot " BORINGSHOT_VERSION L" · F1 截图");
+    const std::wstring tip = L"Boringshot " BORINGSHOT_VERSION L" · " + bs::formatHotkey(g_config.capture) + L" 截图";
+    wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &nid);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);  // refresh the tooltip after a reload
 }
 
 void removeTrayIcon(HWND hwnd) {
@@ -56,6 +68,19 @@ void removeTrayIcon(HWND hwnd) {
     nid.hWnd = hwnd;
     nid.uID = kTrayId;
     Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+// Tray balloon for problems the user can fix (taken hotkeys, bad config lines).
+void notify(const std::wstring& title, const std::wstring& body) {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_host;
+    nid.uID = kTrayId;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_WARNING;
+    wcsncpy_s(nid.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(nid.szInfo, body.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void openPin(gfx::Image img, POINT at) {
@@ -74,7 +99,9 @@ void startCapture() {
         PostMessageW(g_host, kReapMessage, 0, 0);
     };
     g_captureClosed = false;
-    if (capture->open(g_instance, grabScreen(), std::move(cb))) g_capture = std::move(capture);
+    CaptureOptions opts;
+    opts.animate = g_config.animation;
+    if (capture->open(g_instance, grabScreen(g_config.backend), std::move(cb), opts)) g_capture = std::move(capture);
 }
 
 void reap() {
@@ -86,14 +113,49 @@ void reap() {
                  g_pins.end());
 }
 
+// (Re)binds every hotkey; returns the ones the system refused (taken by another app).
+std::vector<std::wstring> registerHotkeys() {
+    std::vector<std::wstring> failed;
+    const struct {
+        int id;
+        bs::Hotkey key;
+    } binds[] = {{kHotkeyCapture, g_config.capture},
+                 {kHotkeyCaptureAlt, g_config.captureAlt},
+                 {kHotkeyWatermark, g_config.watermark}};
+    for (const auto& b : binds) {
+        UnregisterHotKey(g_host, b.id);
+        if (b.key.enabled() && !RegisterHotKey(g_host, b.id, b.key.modifiers | MOD_NOREPEAT, b.key.vk))
+            failed.push_back(bs::formatHotkey(b.key));
+    }
+    return failed;
+}
+
+void applyConfig(bool announce) {
+    g_config = loadConfig(g_configPath, true);
+    g_configStamp = configStamp(g_configPath);
+    g_overlay.updateProfile(g_config.watermarkProfile);
+    const auto failed = registerHotkeys();
+    addTrayIcon(g_host);
+    std::wstring problems;
+    for (const auto& f : failed) problems += L"热键 " + f + L" 已被其他程序占用\n";
+    for (const auto& w : g_config.warnings) problems += L"config.ini " + w + L"\n";
+    if (!problems.empty()) notify(L"Boringshot 设置", problems);
+    else if (announce) notify(L"Boringshot", L"设置已重新加载");
+}
+
 void toggleWatermark() { g_overlay.enable(!g_overlay.enabled()); }
 
 void showTrayMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kCmdCapture, L"截图\tF1 / Ctrl+Alt+A");
+    const std::wstring capture = L"截图\t" + bs::formatHotkey(g_config.capture);
+    const std::wstring watermark = L"水印\t" + bs::formatHotkey(g_config.watermark);
+    AppendMenuW(menu, MF_STRING, kCmdCapture, capture.c_str());
     AppendMenuW(menu, MF_STRING | (g_overlay.enabled() ? MF_CHECKED : MF_UNCHECKED), kCmdToggleWatermark,
-                L"水印\tCtrl+Alt+W");
+                watermark.c_str());
     AppendMenuW(menu, MF_STRING | (g_pins.empty() ? MF_GRAYED : 0u), kCmdClosePins, L"关闭全部贴图");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdSettings, L"设置…（config.ini，保存即生效）");
+    AppendMenuW(menu, MF_STRING, kCmdReload, L"重新加载设置");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, L"退出");
     POINT pt{};
@@ -124,6 +186,11 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kCmdClosePins:
                     for (auto& p : g_pins) p->close();
                     break;
+                case kCmdSettings:
+                    loadConfig(g_configPath, true);  // make sure the file exists
+                    ShellExecuteW(hwnd, L"open", g_configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
+                case kCmdReload: applyConfig(true); break;
                 case kCmdExit: DestroyWindow(hwnd); break;
                 default: break;
             }
@@ -136,6 +203,7 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == kClockTimer && g_overlay.enabled()) g_overlay.refresh(false);
+            if (wp == kConfigTimer && configStamp(g_configPath) != g_configStamp) applyConfig(true);
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -143,6 +211,7 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kClockTimer);
+            KillTimer(hwnd, kConfigTimer);
             UnregisterHotKey(hwnd, kHotkeyCapture);
             UnregisterHotKey(hwnd, kHotkeyCaptureAlt);
             UnregisterHotKey(hwnd, kHotkeyWatermark);
@@ -158,18 +227,32 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // Smoke progress goes to the inherited stderr (ctest pipe) so CI pinpoints a failing step.
-void smokeLog(const char* step) {
+void smokeLog(const std::wstring& step) {
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     if (!err || err == INVALID_HANDLE_VALUE) return;
+    const std::string line = wideToUtf8(L"smoke: " + step + L"\n");
     DWORD written = 0;
-    WriteFile(err, step, static_cast<DWORD>(std::strlen(step)), &written, nullptr);
-    WriteFile(err, "\n", 1, &written, nullptr);
+    WriteFile(err, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
 }
 
-// --smoke: exercise every real platform path (capture, overlay UI, composite,
-// pin, watermark) without user input, then exit. Non-zero = which step failed.
+// --smoke: exercise every real platform path (settings, capture backends,
+// overlay UI, composite, pin, watermark) without user input, then exit.
+// Non-zero = which step failed.
 int runSmoke(HINSTANCE instance) {
-    smokeLog("smoke: watermark");
+    smokeLog(L"settings");
+    wchar_t tmp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring cfgPath = std::wstring(tmp) + L"boringshot-smoke-" + std::to_wstring(GetCurrentProcessId()) +
+                                 L"\\config.ini";
+    const bs::Config created = loadConfig(cfgPath, true);   // writes the default file
+    const bs::Config reread = loadConfig(cfgPath, false);   // parses it back (UTF-8 + BOM)
+    const bool settingsOk = configStamp(cfgPath) != 0 && reread.warnings.empty() &&
+                            reread.capture == created.capture && reread.watermarkProfile.text == created.watermarkProfile.text;
+    DeleteFileW(cfgPath.c_str());
+    RemoveDirectoryW(cfgPath.substr(0, cfgPath.find_last_of(L'\\')).c_str());
+    if (!settingsOk) return 9;
+
+    smokeLog(L"watermark");
     WatermarkOverlay overlay;
     if (!overlay.create(instance)) return 2;
     bs::WatermarkProfile profile;
@@ -179,19 +262,34 @@ int runSmoke(HINSTANCE instance) {
     overlay.destroy();
     if (!watermarkOk) return 3;
 
-    smokeLog("smoke: grab");
-    ScreenGrab grab = grabScreen();
+#ifdef BORINGSHOT_HAS_WGC
+    // WGC availability depends on the machine (CI runners may lack it): report, never fail.
+    gfx::Image wgcImage;
+    const RECT v{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                 GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                 GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+    const bool wgcOk = wgcSupported() && grabWithWgc(v, wgcImage) && !wgcImage.empty();
+    smokeLog(std::wstring(L"wgc ") + (wgcSupported() ? L"supported" : L"unsupported") +
+             (wgcBorderless() ? L", borderless" : L"") + (wgcOk ? L", grab ok" : L", grab skipped/failed"));
+#endif
+
+    ScreenGrab grab = grabScreen(bs::CaptureBackend::Gdi);
+    smokeLog(std::wstring(L"grab via ") + grab.backend);
     if (grab.image.empty() || grab.monitors.empty()) return 4;
     const float w = std::min(320.0f, static_cast<float>(grab.image.width));
     const float h = std::min(200.0f, static_cast<float>(grab.image.height));
-    smokeLog("smoke: capture window");
-    CaptureWindow capture;
-    if (!capture.open(instance, std::move(grab), {})) return 5;
-    const bool captureOk = capture.smoke({0.0f, 0.0f, w, h});
-    capture.close();
-    if (!captureOk) return 6;
 
-    smokeLog("smoke: pin");
+    smokeLog(L"capture window");
+    CaptureWindow capture;
+    if (!capture.open(instance, std::move(grab), {}, {})) return 5;
+    const wchar_t* captureError = capture.smoke({0.0f, 0.0f, w, h});
+    capture.close();
+    if (captureError) {
+        smokeLog(std::wstring(L"capture failed: ") + captureError);
+        return 6;
+    }
+
+    smokeLog(L"pin");
     gfx::Image img;
     img.width = 120;
     img.height = 80;
@@ -200,7 +298,7 @@ int runSmoke(HINSTANCE instance) {
     if (!pin.open(instance, img, {40, 40}, {})) return 7;
     const bool pinOk = pin.smoke();
     pin.close();
-    smokeLog(pinOk ? "smoke: ok" : "smoke: pin failed");
+    smokeLog(pinOk ? L"ok" : L"pin failed");
     return pinOk ? 0 : 8;
 }
 
@@ -238,11 +336,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     }
 
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    addTrayIcon(g_host);
-    RegisterHotKey(g_host, kHotkeyCapture, MOD_NOREPEAT, VK_F1);  // may be taken; Ctrl+Alt+A is the fallback
-    RegisterHotKey(g_host, kHotkeyCaptureAlt, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A');
-    RegisterHotKey(g_host, kHotkeyWatermark, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
+    g_configPath = defaultConfigPath();
+    applyConfig(false);
     SetTimer(g_host, kClockTimer, kClockIntervalMs, nullptr);
+    SetTimer(g_host, kConfigTimer, kConfigPollMs, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

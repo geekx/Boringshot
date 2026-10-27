@@ -35,8 +35,8 @@ public:
     void close();
 
     // Test hook: drives every tool, style, pick/drag, mosaic and the animation
-    // through the real paint + composite paths.
-    bool smoke(const bs::Rect& r);
+    // through the real paint + composite paths. Returns nullptr or the failed check.
+    const wchar_t* smoke(const bs::Rect& r);
 
 private:
     enum class Mode { Picking, Dragging, Selected };

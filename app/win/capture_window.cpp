@@ -1444,10 +1444,10 @@ void CaptureWindow::paintMagnifier() {
 
 // ───────────────────────────── smoke ─────────────────────────────
 
-bool CaptureWindow::smoke(const bs::Rect& r) {
-    if (!hwnd_) return false;
+const wchar_t* CaptureWindow::smoke(const bs::Rect& r) {
+    if (!hwnd_) return L"no window";
     sel_ = bs::intersect(r, bounds());
-    if (bs::isEmpty(sel_)) return false;
+    if (bs::isEmpty(sel_)) return L"empty selection";
     if (opts_.animate) {
         paint();  // mid-animation frame: ripple + shake
         animStart_ -= 1000000000LL;
@@ -1466,14 +1466,14 @@ bool CaptureWindow::smoke(const bs::Rect& r) {
         tool_ = static_cast<Tool>(t);
         if (t == 8) run(Action::MosaicMode, 0, +1);  // blur
         run(Action::Finish, 0, +1);
-        const bs::Vec2 a = o + bs::Vec2{column, 10.0f}, b = a + bs::Vec2{30.0f, 40.0f};
+        const bs::Vec2 a = o + bs::Vec2{column, 10.0f}, b = a + bs::Vec2{25.0f, 35.0f};
         onLButtonDown(a);
-        onMouseMove(b, t == 1);
+        onMouseMove(b, t == 1);  // Shift squares the rect to 35 px, still inside its column
         onLButtonUp(b, t == 1);
-        column += 40.0f;
+        column += 50.0f;
         tool_ = Tool::None;
     }
-    if (doc_.shapes().size() != 6) return false;
+    if (doc_.shapes().size() != 6) return L"drag tools did not create 6 shapes";
 
     // Text with font / bold / italic / numbered list / backing plate.
     tool_ = Tool::Text;
@@ -1486,7 +1486,8 @@ bool CaptureWindow::smoke(const bs::Rect& r) {
     editShape_.text += L"\n* 要点";
     commitEdit();
     const bs::Shape& text = doc_.shapes().back();
-    if (text.textStyle.list != bs::ListStyle::Numbered || !text.textStyle.italic || text.textSize.x <= 0) return false;
+    if (text.textStyle.list != bs::ListStyle::Numbered || !text.textStyle.italic || text.textSize.x <= 0)
+        return L"text style not applied";
 
     // MLEADER with caps on both ends, then pick it and drag its kink.
     tool_ = Tool::MLeader;
@@ -1502,12 +1503,12 @@ bool CaptureWindow::smoke(const bs::Rect& r) {
     const bs::Vec2 kink = doc_.shapes()[li].leader.kink;
     onLButtonDown(kink);  // picks the leader body
     onLButtonUp(kink, false);
-    if (picked_ != li) return false;
+    if (picked_ != li) return L"click did not pick the leader";
     onLButtonDown(kink);  // now the kink joint
     onMouseMove(kink + bs::Vec2{10, -10}, false);
     paint();  // angle readout while dragging
     onLButtonUp(kink + bs::Vec2{10, -10}, false);
-    if (!(doc_.shapes()[li].leader.kink == kink + bs::Vec2{10, -10})) return false;
+    if (!(doc_.shapes()[li].leader.kink == kink + bs::Vec2{10, -10})) return L"kink drag not applied";
     run(Action::Head, 0, +1);  // restyle the picked shape
     paint();
 
@@ -1516,15 +1517,16 @@ bool CaptureWindow::smoke(const bs::Rect& r) {
     beginEditExisting(li);
     onChar(L'B');
     commitEdit();
-    if (doc_.shapes()[li].text != L"AB") return false;
+    if (doc_.shapes()[li].text != L"AB") return L"label re-edit failed";
     picked_ = li;
     deletePicked();
-    if (doc_.shapes().size() != count - 1) return false;
+    if (doc_.shapes().size() != count - 1) return L"delete failed";
     doc_.undo();
-    if (doc_.shapes().size() != count) return false;
+    if (doc_.shapes().size() != count) return L"undo of delete failed";
 
     paint();
     const gfx::Image img = composite();
-    return img.width == static_cast<int>(std::round(sel_.width())) &&
-           img.height == static_cast<int>(std::round(sel_.height()));
+    const bool sized = img.width == static_cast<int>(std::round(sel_.width())) &&
+                       img.height == static_cast<int>(std::round(sel_.height()));
+    return sized ? nullptr : L"composite size mismatch";
 }

@@ -4,6 +4,7 @@
 
 #include <vector>
 
+#include "boringshot/config.h"
 #include "boringshot/geometry.h"
 #include "gfx.h"
 
@@ -13,7 +14,9 @@ struct ScreenGrab {
     gfx::Image image;
     std::vector<bs::Rect> windows;    // local coords, Z order (top first), monitors last
     std::vector<bs::Rect> monitors;   // local coords
+    const wchar_t* backend = L"none"; // which path produced `image`
 };
 
-// GDI BitBlt grab (WGC comes later); must run before any overlay is shown.
-ScreenGrab grabScreen();
+// Must run before any overlay is shown. Auto picks WGC where its border can be
+// disabled (Win11), GDI BitBlt otherwise; a failed WGC grab falls back to GDI.
+ScreenGrab grabScreen(bs::CaptureBackend backend = bs::CaptureBackend::Auto);
