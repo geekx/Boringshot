@@ -28,6 +28,7 @@ OutputBaseFilename=Boringshot-{#AppVersion}-win64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\app\win\boringshot.ico
 UninstallDisplayIcon={app}\boringshot.exe
 CloseApplications=yes
 

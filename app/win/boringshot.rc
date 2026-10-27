@@ -1,0 +1,5 @@
+// Application icon (first icon resource = the exe icon in Explorer / taskbar).
+// Regenerate boringshot.ico with packaging/make_icon.py.
+#include "resource.h"
+
+IDI_BORINGSHOT ICON "boringshot.ico"
