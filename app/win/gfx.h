@@ -46,20 +46,20 @@ inline D2D1_COLOR_F toD2D(const bs::Color& c) { return D2D1::ColorF(c.r, c.g, c.
 ComPtr<ID2D1Bitmap> makeBitmap(ID2D1RenderTarget* rt, const Image& img);
 Image crop(const Image& src, const bs::Rect& r);
 
-// Annotation font; size in DIPs (== px, all targets run at 96 dpi).
-ComPtr<IDWriteTextLayout> textLayout(const std::wstring& text, float fontSize);
-D2D1_SIZE_F measureText(const std::wstring& text, float fontSize);
-// Caret just after the last character, relative to the layout origin.
-D2D1_RECT_F caretRect(const std::wstring& text, float fontSize);
-
-// MLEADER geometry derived from a shape's stroke width and font size.
-bs::MLeaderGeometry leaderGeometry(const bs::Shape& s);
+// Label layout for a text style; size in DIPs (== px, all targets run at 96 dpi).
+ComPtr<IDWriteTextLayout> textLayout(const std::wstring& text, float fontSize, const bs::TextStyle& style);
+// Measures displayText(s) and stores it in s.textSize / s.leader.textWidth.
+void measureShapeText(bs::Shape& s);
+// Caret after the last displayed character, relative to the label origin.
+D2D1_RECT_F caretRect(const bs::Shape& s);
 
 // Where a Text / MLeader shape's label is drawn (layout origin).
 bs::Vec2 textOrigin(const bs::Shape& s);
 
-void drawShape(ID2D1RenderTarget* rt, const bs::Shape& s);
-void drawShapes(ID2D1RenderTarget* rt, const std::vector<bs::Shape>& shapes);
+// `source` feeds Mosaic shapes (same coordinates as the shapes).
+void drawShape(ID2D1RenderTarget* rt, const bs::Shape& s, const Image* source);
+void drawShapes(ID2D1RenderTarget* rt, const std::vector<bs::Shape>& shapes, const Image* source,
+                std::size_t skip = static_cast<std::size_t>(-1));
 
 // Crop + annotations (translated so `selection` becomes the origin).
 Image renderComposite(const Image& screen, const bs::Rect& selection,

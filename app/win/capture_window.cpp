@@ -6,13 +6,16 @@
 #include <cmath>
 #include <cwchar>
 
+#include "boringshot/anim.h"
 #include "boringshot/color.h"
+#include "boringshot/shape_edit.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 constexpr wchar_t kClassName[] = L"Boringshot.Capture";
+constexpr UINT_PTR kAnimTimer = 1;
 
 const bs::Color kPalette[] = {
     {1.00f, 0.30f, 0.31f, 1.0f},  // red
@@ -50,14 +53,37 @@ bs::ShapeKind kindFor(int tool) {
         case 5: return bs::ShapeKind::Pen;
         case 6: return bs::ShapeKind::Text;
         case 7: return bs::ShapeKind::MLeader;
+        case 8: return bs::ShapeKind::Mosaic;
         default: return bs::ShapeKind::Rect;
     }
 }
 
-ComPtr<IDWriteTextFormat> makeFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight, bool center) {
+int toolFor(bs::ShapeKind k) {
+    switch (k) {
+        case bs::ShapeKind::Rect: return 1;
+        case bs::ShapeKind::Ellipse: return 2;
+        case bs::ShapeKind::Line: return 3;
+        case bs::ShapeKind::Arrow: return 4;
+        case bs::ShapeKind::Pen: return 5;
+        case bs::ShapeKind::Text: return 6;
+        case bs::ShapeKind::MLeader: return 7;
+        case bs::ShapeKind::Mosaic: return 8;
+    }
+    return 1;
+}
+
+bool hasText(bs::ShapeKind k) { return k == bs::ShapeKind::Text || k == bs::ShapeKind::MLeader; }
+bool hasCaps(bs::ShapeKind k) {
+    return k == bs::ShapeKind::Line || k == bs::ShapeKind::Arrow || k == bs::ShapeKind::MLeader;
+}
+
+int wrap(int v, int n) { return ((v % n) + n) % n; }
+
+ComPtr<IDWriteTextFormat> makeFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
+                                     DWRITE_FONT_STYLE style, bool center) {
     ComPtr<IDWriteTextFormat> f;
-    gfx::factories().dwrite->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
-                                              DWRITE_FONT_STRETCH_NORMAL, size, L"", f.GetAddressOf());
+    gfx::factories().dwrite->CreateTextFormat(family, nullptr, weight, style, DWRITE_FONT_STRETCH_NORMAL, size, L"",
+                                              f.GetAddressOf());
     if (f && center) {
         f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -65,15 +91,23 @@ ComPtr<IDWriteTextFormat> makeFormat(const wchar_t* family, float size, DWRITE_F
     return f;
 }
 
+LONGLONG qpcNow() {
+    LARGE_INTEGER t{};
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
 }  // namespace
 
 // ───────────────────────────── lifecycle ─────────────────────────────
 
-bool CaptureWindow::open(HINSTANCE instance, ScreenGrab grab, Callbacks cb) {
+bool CaptureWindow::open(HINSTANCE instance, ScreenGrab grab, Callbacks cb, CaptureOptions opts) {
     if (grab.image.empty()) return false;
     grab_ = std::move(grab);
     cb_ = std::move(cb);
+    opts_ = opts;
     ui_ = static_cast<float>(GetDpiForSystem()) / 96.0f;
+    for (int t = 0; t < kToolCount; ++t) templates_[static_cast<std::size_t>(t)] = bs::makeShape(kindFor(t));
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -92,6 +126,12 @@ bool CaptureWindow::open(HINSTANCE instance, ScreenGrab grab, Callbacks cb) {
     GetCursorPos(&pt);
     cursor_ = {static_cast<float>(pt.x - v.left), static_cast<float>(pt.y - v.top)};
     hover_ = bs::pickWindowRect(grab_.windows, cursor_);
+    // The frame is already frozen, so the animation can never leak into the capture (doc §7.3).
+    if (opts_.animate) {
+        animating_ = true;
+        animStart_ = qpcNow();
+        SetTimer(hwnd_, kAnimTimer, 10, nullptr);
+    }
     ShowWindow(hwnd_, SW_SHOW);
     SetForegroundWindow(hwnd_);
     UpdateWindow(hwnd_);
@@ -132,6 +172,15 @@ LRESULT CaptureWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_ERASEBKGND:
             return 1;
+        case WM_TIMER:
+            if (wp == kAnimTimer) {
+                if (animElapsedMs() >= bs::rippleTotalMs()) {
+                    animating_ = false;
+                    KillTimer(hwnd_, kAnimTimer);
+                }
+                invalidate();
+            }
+            return 0;
         case WM_SIZE:
             if (rt_) rt_->Resize(D2D1::SizeU(LOWORD(lp), HIWORD(lp)));
             return 0;
@@ -139,18 +188,19 @@ LRESULT CaptureWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
             onMouseMove(pointFrom(lp), (wp & MK_SHIFT) != 0);
             return 0;
         case WM_LBUTTONDOWN:
+            if (animating_) return 0;  // no input until the summon animation settles
             SetCapture(hwnd_);
             onLButtonDown(pointFrom(lp));
             return 0;
         case WM_LBUTTONUP:
             ReleaseCapture();
-            onLButtonUp(pointFrom(lp), (wp & MK_SHIFT) != 0);
+            if (!animating_) onLButtonUp(pointFrom(lp), (wp & MK_SHIFT) != 0);
             return 0;
         case WM_LBUTTONDBLCLK:
-            onDoubleClick(pointFrom(lp));
+            if (!animating_) onDoubleClick(pointFrom(lp));
             return 0;
         case WM_RBUTTONUP:
-            onRButtonUp();
+            if (!animating_) onRButtonUp(pointFrom(lp));
             return 0;
         case WM_KEYDOWN:
             onKeyDown(wp);
@@ -173,7 +223,21 @@ LRESULT CaptureWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd_, msg, wp, lp);
 }
 
-// ───────────────────────────── input ─────────────────────────────
+// ───────────────────────────── state helpers ─────────────────────────────
+
+void CaptureWindow::invalidate() {
+    if (!hwnd_) return;  // never InvalidateRect(nullptr): that repaints every window
+    if (mode_ == Mode::Selected) layoutToolbar();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+float CaptureWindow::animElapsedMs() const {
+    LARGE_INTEGER f{};
+    QueryPerformanceFrequency(&f);
+    return f.QuadPart > 0 ? static_cast<float>(static_cast<double>(qpcNow() - animStart_) * 1000.0 /
+                                               static_cast<double>(f.QuadPart))
+                          : 1e9f;
+}
 
 bs::Rect CaptureWindow::bounds() const {
     return {0.0f, 0.0f, static_cast<float>(grab_.image.width), static_cast<float>(grab_.image.height)};
@@ -198,14 +262,49 @@ int CaptureWindow::buttonAt(bs::Vec2 p) const {
     return -1;
 }
 
-bs::Shape CaptureWindow::styledShape(bs::ShapeKind kind) const {
-    bs::Shape s;
-    s.kind = kind;
+bs::Shape CaptureWindow::styledShape(Tool t) const {
+    bs::Shape s = templates_[static_cast<std::size_t>(t)];
     s.color = kPalette[colorIndex_];
     s.strokeWidth = kWidths[widthIndex_];
     s.fontSize = kFontSizes[widthIndex_];
     return s;
 }
+
+std::size_t CaptureWindow::hiddenIndex() const {
+    if (pick_.active && picked_) return *picked_;
+    if (edit_ != Edit::None && editIndex_) return *editIndex_;
+    return static_cast<std::size_t>(-1);
+}
+
+std::optional<bs::ShapeKind> CaptureWindow::contextKind() const {
+    if (edit_ != Edit::None) return editShape_.kind;
+    if (picked_ && *picked_ < doc_.shapes().size()) return doc_.shapes()[*picked_].kind;
+    if (tool_ != Tool::None) return kindFor(static_cast<int>(tool_));
+    return std::nullopt;
+}
+
+const bs::Shape& CaptureWindow::styleSource() const {
+    if (edit_ != Edit::None) return editShape_;
+    if (picked_ && *picked_ < doc_.shapes().size()) return doc_.shapes()[*picked_];
+    return templates_[static_cast<std::size_t>(tool_)];
+}
+
+void CaptureWindow::applyStyle(const std::function<void(bs::Shape&)>& fn) {
+    const auto kind = contextKind();
+    if (!kind) return;
+    if (edit_ != Edit::None) {
+        fn(editShape_);
+        gfx::measureShapeText(editShape_);
+    } else if (picked_ && *picked_ < doc_.shapes().size()) {
+        bs::Shape s = doc_.shapes()[*picked_];
+        fn(s);
+        if (hasText(s.kind)) gfx::measureShapeText(s);
+        doc_.replace(*picked_, std::move(s));
+    }
+    fn(templates_[static_cast<std::size_t>(toolFor(*kind))]);  // next shapes follow the last choice
+}
+
+// ───────────────────────────── input ─────────────────────────────
 
 void CaptureWindow::onMouseMove(bs::Vec2 p, bool shift) {
     cursor_ = p;
@@ -218,7 +317,10 @@ void CaptureWindow::onMouseMove(bs::Vec2 p, bool shift) {
             break;
         case Mode::Selected: {
             const bs::Vec2 clamped{std::clamp(p.x, sel_.left, sel_.right), std::clamp(p.y, sel_.top, sel_.bottom)};
-            if (dragHandle_ != bs::Handle::None) {
+            if (pick_.active) {
+                live_ = pick_.handle >= 0 ? bs::moveControlPoint(pick_.original, pick_.handle, clamped, shift)
+                                          : bs::translate(pick_.original, p - pick_.start);
+            } else if (dragHandle_ != bs::Handle::None) {
                 sel_ = bs::dragHandle(selAtDragStart_, dragHandle_, p - dragStart_, bounds());
             } else if (drawing_) {
                 if (draft_.kind == bs::ShapeKind::Pen)
@@ -226,6 +328,7 @@ void CaptureWindow::onMouseMove(bs::Vec2 p, bool shift) {
                 else
                     draft_.b = bs::constrainDrag(draft_.kind, draft_.a, clamped, shift);
             } else if (tool_ == Tool::MLeader) {
+                leader_.setSnap(!shift);  // 45° snapping by default, Shift for free angles
                 leader_.pointerMove(clamped);
             }
             hoverButton_ = buttonAt(p);
@@ -247,27 +350,40 @@ void CaptureWindow::onLButtonDown(bs::Vec2 p) {
     }
     if (mode_ != Mode::Selected) return;
 
-    if (edit_ != Edit::None) {
+    if (const int b = buttonAt(p); b >= 0) {  // style buttons act on the text being edited
+        pressedButton_ = b;
+        return;
+    }
+    if (edit_ != Edit::None) {  // clicking away just finishes the text
         commitEdit();
-        if (buttonAt(p) < 0) {  // clicking away just finishes the text
+        invalidate();
+        return;
+    }
+    const bool leaderBusy = tool_ == Tool::MLeader && leader_.phase() != bs::MLeaderTool::Phase::ArrowTip;
+    if (!leaderBusy && bs::contains(sel_, p)) {
+        if (const auto hit = bs::hitTestShapes(doc_.shapes(), p, 5.0f * ui_, picked_)) {
+            picked_ = hit->index;
+            pick_ = {true, hit->handle, p, doc_.shapes()[hit->index]};
+            live_ = pick_.original;
             invalidate();
             return;
         }
     }
-    if (const int b = buttonAt(p); b >= 0) {
-        pressedButton_ = b;
-        return;
-    }
+    picked_.reset();
 
     const bs::Handle h = bs::hitTestHandle(sel_, p, 6.0f * ui_);
     const bool resize = h != bs::Handle::None && h != bs::Handle::Move;
-    if (resize || (tool_ == Tool::None && h == bs::Handle::Move)) {
+    if (!leaderBusy && (resize || (tool_ == Tool::None && h == bs::Handle::Move))) {
         dragHandle_ = h;
         dragStart_ = p;
         selAtDragStart_ = sel_;
+        invalidate();
         return;
     }
-    if (tool_ == Tool::None || !bs::contains(sel_, p)) return;
+    if (tool_ == Tool::None || !bs::contains(sel_, p)) {
+        invalidate();
+        return;
+    }
 
     switch (tool_) {
         case Tool::Text:
@@ -279,7 +395,7 @@ void CaptureWindow::onLButtonDown(bs::Vec2 p) {
             break;
         default:
             drawing_ = true;
-            draft_ = styledShape(kindFor(static_cast<int>(tool_)));
+            draft_ = styledShape(tool_);
             draft_.a = draft_.b = p;
             draft_.points = {p};
             break;
@@ -295,7 +411,6 @@ void CaptureWindow::onLButtonUp(bs::Vec2 p, bool shift) {
             return;
         }
         mode_ = Mode::Selected;
-        layoutToolbar();
         invalidate();
         return;
     }
@@ -304,40 +419,57 @@ void CaptureWindow::onLButtonUp(bs::Vec2 p, bool shift) {
         pressedButton_ = -1;
         if (buttonAt(p) == b) {
             const Button btn = buttons_[static_cast<std::size_t>(b)];
-            run(btn.action, btn.arg);  // may close the window
+            run(btn.action, btn.arg, +1);  // may close the window
         }
         return;
     }
-    if (dragHandle_ != bs::Handle::None) {
+    if (pick_.active) {
+        pick_.active = false;
+        if (picked_ && !bs::isClick(pick_.start, p)) doc_.replace(*picked_, live_);  // one undo step per drag
+    } else if (dragHandle_ != bs::Handle::None) {
         dragHandle_ = bs::Handle::None;
         if (bs::isEmpty(sel_)) {
             resetToPicking();
             return;
         }
-        layoutToolbar();
     } else if (drawing_) {
         drawing_ = false;
         if (draft_.kind != bs::ShapeKind::Pen) {
             const bs::Vec2 c{std::clamp(p.x, sel_.left, sel_.right), std::clamp(p.y, sel_.top, sel_.bottom)};
             draft_.b = bs::constrainDrag(draft_.kind, draft_.a, c, shift);
         }
-        doc_.add(draft_);
+        if (doc_.add(draft_)) picked_.reset();
     }
     invalidate();
 }
 
 void CaptureWindow::onDoubleClick(bs::Vec2 p) {
-    // Double-click inside the selection = copy and done (works right after snapping a window).
-    if (mode_ == Mode::Selected && tool_ == Tool::None && edit_ == Edit::None && bs::contains(sel_, p))
-        finishCopy();
+    if (mode_ != Mode::Selected || edit_ != Edit::None) return;
+    // Double-click a label to edit it in place; elsewhere (no tool) = copy and done.
+    if (const auto hit = bs::hitTestShapes(doc_.shapes(), p, 5.0f * ui_, std::nullopt);
+        hit && hasText(doc_.shapes()[hit->index].kind)) {
+        beginEditExisting(hit->index);
+        invalidate();
+        return;
+    }
+    if (tool_ == Tool::None && bs::contains(sel_, p)) finishCopy();
 }
 
-void CaptureWindow::onRButtonUp() {
+void CaptureWindow::onRButtonUp(bs::Vec2 p) {
+    if (const int b = buttonAt(p); b >= 0) {  // right-click cycles a style backwards
+        const Button btn = buttons_[static_cast<std::size_t>(b)];
+        if (btn.action >= Action::Finish && btn.action <= Action::MosaicMode) {
+            run(btn.action, btn.arg, -1);
+            return;
+        }
+    }
     if (edit_ != Edit::None) {
         cancelEdit();
     } else if (drawing_ || leader_.phase() != bs::MLeaderTool::Phase::ArrowTip) {
         drawing_ = false;
         leader_.cancel();
+    } else if (picked_) {
+        picked_.reset();
     } else if (mode_ == Mode::Selected) {
         resetToPicking();
         return;
@@ -353,6 +485,8 @@ void CaptureWindow::onKeyDown(WPARAM key) {
     const bool shift = keyDown(VK_SHIFT);
     if (edit_ != Edit::None) {  // characters arrive through WM_CHAR
         if (key == VK_ESCAPE) cancelEdit();
+        if (ctrl && key == 'B') applyStyle([](bs::Shape& s) { s.textStyle.bold = !s.textStyle.bold; });
+        if (ctrl && key == 'I') applyStyle([](bs::Shape& s) { s.textStyle.italic = !s.textStyle.italic; });
         invalidate();
         return;
     }
@@ -362,19 +496,31 @@ void CaptureWindow::onKeyDown(WPARAM key) {
             if (drawing_ || leader_.phase() != bs::MLeaderTool::Phase::ArrowTip) {
                 drawing_ = false;
                 leader_.cancel();
+            } else if (picked_) {
+                picked_.reset();
             } else {
                 close();
                 return;
             }
             break;
+        case VK_DELETE:
+        case VK_BACK:
+            deletePicked();
+            break;
         case VK_RETURN:
             if (selected) finishCopy();
             return;
         case 'Z':
-            if (ctrl) shift ? doc_.redo() : doc_.undo();
+            if (ctrl) {
+                shift ? doc_.redo() : doc_.undo();
+                picked_.reset();
+            }
             break;
         case 'Y':
-            if (ctrl) doc_.redo();
+            if (ctrl) {
+                doc_.redo();
+                picked_.reset();
+            }
             break;
         case 'C':
             if (ctrl && selected) {
@@ -414,9 +560,10 @@ void CaptureWindow::onKeyDown(WPARAM key) {
             const float step = shift ? 10.0f : 1.0f;
             const bs::Vec2 d{key == VK_LEFT ? -step : key == VK_RIGHT ? step : 0.0f,
                              key == VK_UP ? -step : key == VK_DOWN ? step : 0.0f};
-            if (selected) {
+            if (selected && picked_) {
+                doc_.replace(*picked_, bs::translate(doc_.shapes()[*picked_], d));  // nudge the shape
+            } else if (selected) {
                 sel_ = bs::dragHandle(sel_, bs::Handle::Move, d, bounds());
-                layoutToolbar();
             } else {  // pixel-precise picking
                 POINT pt{};
                 GetCursorPos(&pt);
@@ -425,7 +572,7 @@ void CaptureWindow::onKeyDown(WPARAM key) {
             break;
         }
         default:
-            if (selected && key >= '1' && key <= '7') selectTool(static_cast<Tool>(key - '0'));
+            if (selected && key >= '1' && key <= '8') selectTool(static_cast<Tool>(key - '0'));
             break;
     }
     invalidate();
@@ -442,10 +589,13 @@ void CaptureWindow::onChar(wchar_t c) {
             text += L'\n';
         } else {
             commitEdit();
+            invalidate();
+            return;
         }
     } else if (c >= 32) {
         text += c;
     }
+    gfx::measureShapeText(editShape_);
     placeImeWindow();
     invalidate();
 }
@@ -453,6 +603,10 @@ void CaptureWindow::onChar(wchar_t c) {
 void CaptureWindow::updateCursor() {
     LPCWSTR id = IDC_CROSS;
     if (mode_ == Mode::Selected) {
+        const bool leaderBusy = tool_ == Tool::MLeader && leader_.phase() != bs::MLeaderTool::Phase::ArrowTip;
+        const auto hit = leaderBusy || !bs::contains(sel_, cursor_)
+                             ? std::nullopt
+                             : bs::hitTestShapes(doc_.shapes(), cursor_, 5.0f * ui_, picked_);
         const bs::Handle h =
             dragHandle_ != bs::Handle::None ? dragHandle_ : bs::hitTestHandle(sel_, cursor_, 6.0f * ui_);
         switch (h) {
@@ -469,6 +623,8 @@ void CaptureWindow::updateCursor() {
                 break;
             case bs::Handle::None: id = IDC_ARROW; break;
         }
+        if (pick_.active || hit) id = (pick_.active ? pick_.handle >= 0 : hit->handle >= 0) ? IDC_CROSS : IDC_SIZEALL;
+        if (edit_ != Edit::None) id = IDC_IBEAM;
         if (buttonAt(cursor_) >= 0) id = IDC_HAND;
     }
     SetCursor(LoadCursorW(nullptr, id));
@@ -480,22 +636,86 @@ void CaptureWindow::selectTool(Tool t) {
     if (edit_ != Edit::None) commitEdit();
     leader_.cancel();
     drawing_ = false;
+    picked_.reset();
     tool_ = tool_ == t ? Tool::None : t;
 }
 
-void CaptureWindow::run(Action a, int arg) {
+void CaptureWindow::run(Action a, int arg, int dir) {
     switch (a) {
         case Action::Tool: selectTool(static_cast<Tool>(arg)); break;
-        case Action::Color: colorIndex_ = std::clamp(arg, 0, kPaletteSize - 1); break;
-        case Action::Width: widthIndex_ = std::clamp(arg, 0, kWidthCount - 1); break;
-        case Action::Undo: doc_.undo(); break;
-        case Action::Redo: doc_.redo(); break;
+        case Action::Color: {
+            colorIndex_ = std::clamp(arg, 0, kPaletteSize - 1);
+            const bs::Color c = kPalette[colorIndex_];
+            if (edit_ != Edit::None || picked_) applyStyle([c](bs::Shape& s) { s.color = c; });
+            break;
+        }
+        case Action::Width: {
+            widthIndex_ = std::clamp(arg, 0, kWidthCount - 1);
+            const float w = kWidths[widthIndex_], f = kFontSizes[widthIndex_];
+            if (edit_ != Edit::None || picked_)
+                applyStyle([w, f](bs::Shape& s) {
+                    s.strokeWidth = w;
+                    s.fontSize = f;
+                });
+            break;
+        }
+        case Action::Finish:
+            applyStyle([dir](bs::Shape& s) {
+                s.finish = static_cast<bs::LineFinish>(wrap(static_cast<int>(s.finish) + dir, bs::kLineFinishCount));
+            });
+            break;
+        case Action::Head:
+            applyStyle([dir](bs::Shape& s) {
+                s.head = static_cast<bs::EndShape>(wrap(static_cast<int>(s.head) + dir, bs::kEndShapeCount));
+            });
+            break;
+        case Action::Tail:
+            applyStyle([dir](bs::Shape& s) {
+                s.tail = static_cast<bs::EndShape>(wrap(static_cast<int>(s.tail) + dir, bs::kEndShapeCount));
+            });
+            break;
+        case Action::Font:
+            applyStyle([dir](bs::Shape& s) { s.textStyle.font = wrap(s.textStyle.font + dir, bs::kFontCount); });
+            break;
+        case Action::Bold:
+            applyStyle([](bs::Shape& s) { s.textStyle.bold = !s.textStyle.bold; });
+            break;
+        case Action::Italic:
+            applyStyle([](bs::Shape& s) { s.textStyle.italic = !s.textStyle.italic; });
+            break;
+        case Action::List:
+            applyStyle([dir](bs::Shape& s) {
+                s.textStyle.list = static_cast<bs::ListStyle>(wrap(static_cast<int>(s.textStyle.list) + dir, 3));
+            });
+            break;
+        case Action::Plate:
+            applyStyle([](bs::Shape& s) { s.textStyle.background = !s.textStyle.background; });
+            break;
+        case Action::MosaicMode:
+            applyStyle([](bs::Shape& s) {
+                s.mosaic = s.mosaic == bs::MosaicMode::Pixelate ? bs::MosaicMode::Blur : bs::MosaicMode::Pixelate;
+            });
+            break;
+        case Action::Delete: deletePicked(); break;
+        case Action::Undo:
+            doc_.undo();
+            picked_.reset();
+            break;
+        case Action::Redo:
+            doc_.redo();
+            picked_.reset();
+            break;
         case Action::Pin: finishPin(); return;
         case Action::Save: finishSave(); return;
         case Action::Copy: finishCopy(); return;
         case Action::Cancel: close(); return;
     }
+    if (edit_ != Edit::None) placeImeWindow();
     invalidate();
+}
+
+void CaptureWindow::deletePicked() {
+    if (picked_ && doc_.remove(*picked_)) picked_.reset();
 }
 
 gfx::Image CaptureWindow::composite() {
@@ -528,6 +748,9 @@ void CaptureWindow::resetToPicking() {
     doc_.clear();
     drawing_ = false;
     edit_ = Edit::None;
+    editIndex_.reset();
+    picked_.reset();
+    pick_.active = false;
     leader_.cancel();
     tool_ = Tool::None;
     dragHandle_ = bs::Handle::None;
@@ -540,33 +763,58 @@ void CaptureWindow::resetToPicking() {
 
 void CaptureWindow::beginEdit(Edit kind, bs::Vec2 at) {
     edit_ = kind;
+    editIndex_.reset();
+    picked_.reset();
     if (kind == Edit::Text) {
-        editShape_ = styledShape(bs::ShapeKind::Text);
-        editShape_.a = at - bs::Vec2{0.0f, gfx::measureText(L"Ag", editShape_.fontSize).height * 0.5f};
+        editShape_ = styledShape(Tool::Text);
+        gfx::measureShapeText(editShape_);
+        editShape_.a = at - bs::Vec2{0.0f, editShape_.textSize.y * 0.5f};
     } else {
-        editShape_ = styledShape(bs::ShapeKind::MLeader);
+        editShape_ = styledShape(Tool::MLeader);
         editShape_.leader = leader_.input();
     }
     editShape_.text.clear();
+    gfx::measureShapeText(editShape_);
+    placeImeWindow();
+}
+
+void CaptureWindow::beginEditExisting(std::size_t index) {
+    const bs::Shape& s = doc_.shapes()[index];
+    edit_ = s.kind == bs::ShapeKind::Text ? Edit::Text : Edit::LeaderLabel;
+    editIndex_ = index;
+    editShape_ = s;
+    picked_ = index;
+    pick_.active = false;
     placeImeWindow();
 }
 
 void CaptureWindow::commitEdit() {
     if (edit_ == Edit::None) return;
-    doc_.add(editShape_);  // empty Text is dropped; a bare leader is kept
+    gfx::measureShapeText(editShape_);
+    if (editIndex_) {
+        if (editShape_.kind == bs::ShapeKind::Text && editShape_.text.empty())
+            doc_.remove(*editIndex_);  // emptied label = delete
+        else
+            doc_.replace(*editIndex_, editShape_);
+    } else {
+        doc_.add(editShape_);  // empty Text is dropped; a bare leader is kept
+    }
     if (edit_ == Edit::LeaderLabel) leader_.cancel();
     edit_ = Edit::None;
+    editIndex_.reset();
+    picked_.reset();
 }
 
 void CaptureWindow::cancelEdit() {
     if (edit_ == Edit::LeaderLabel) leader_.cancel();
     edit_ = Edit::None;
+    editIndex_.reset();
 }
 
 void CaptureWindow::placeImeWindow() {
     if (edit_ == Edit::None || !hwnd_) return;
     const bs::Vec2 o = gfx::textOrigin(editShape_);
-    const D2D1_RECT_F caret = gfx::caretRect(editShape_.text, editShape_.fontSize);
+    const D2D1_RECT_F caret = gfx::caretRect(editShape_);
     if (HIMC imc = ImmGetContext(hwnd_)) {
         COMPOSITIONFORM cf{};
         cf.dwStyle = CFS_POINT;
@@ -579,8 +827,9 @@ void CaptureWindow::placeImeWindow() {
 std::optional<bs::Shape> CaptureWindow::previewShape() const {
     if (drawing_) return draft_;
     if (edit_ != Edit::None) return editShape_;
+    if (pick_.active) return live_;
     if (tool_ == Tool::MLeader && leader_.phase() != bs::MLeaderTool::Phase::ArrowTip) {
-        bs::Shape s = styledShape(bs::ShapeKind::MLeader);
+        bs::Shape s = styledShape(Tool::MLeader);
         s.leader = leader_.input();
         return s;
     }
@@ -598,13 +847,26 @@ bool CaptureWindow::ensureTarget() {
         96.0f, 96.0f);
     const auto hwndProps = D2D1::HwndRenderTargetProperties(
         hwnd_, D2D1::SizeU(static_cast<UINT32>(rc.right), static_cast<UINT32>(rc.bottom)));
-    if (FAILED(gfx::factories().d2d->CreateHwndRenderTarget(props, hwndProps, rt_.GetAddressOf()))) return false;
+    auto& f = gfx::factories();
+    if (FAILED(f.d2d->CreateHwndRenderTarget(props, hwndProps, rt_.GetAddressOf()))) return false;
     shotBitmap_ = gfx::makeBitmap(rt_.Get(), grab_.image);
     rt_->CreateSolidColorBrush(kOnSurface, brush_.ReleaseAndGetAddressOf());
-    if (!labelFont_) labelFont_ = makeFormat(L"Segoe UI", 12.0f * ui_, DWRITE_FONT_WEIGHT_NORMAL, false);
-    if (!iconFont_) iconFont_ = makeFormat(L"Segoe MDL2 Assets", 16.0f * ui_, DWRITE_FONT_WEIGHT_NORMAL, true);
-    if (!glyphFont_) glyphFont_ = makeFormat(L"Segoe UI", 18.0f * ui_, DWRITE_FONT_WEIGHT_SEMI_BOLD, true);
-    return shotBitmap_ && brush_ && labelFont_ && iconFont_ && glyphFont_;
+    if (!dashStroke_)
+        f.d2d->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                                                             D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER, 10.0f,
+                                                             D2D1_DASH_STYLE_DASH),
+                                 nullptr, 0, dashStroke_.GetAddressOf());
+    const auto N = DWRITE_FONT_WEIGHT_NORMAL;
+    const auto upright = DWRITE_FONT_STYLE_NORMAL;
+    if (!labelFont_) labelFont_ = makeFormat(L"Segoe UI", 12.0f * ui_, N, upright, false);
+    if (!iconFont_) iconFont_ = makeFormat(L"Segoe MDL2 Assets", 16.0f * ui_, N, upright, true);
+    if (!glyphFont_) glyphFont_ = makeFormat(L"Segoe UI", 17.0f * ui_, DWRITE_FONT_WEIGHT_BOLD, upright, true);
+    if (!italicFont_) italicFont_ = makeFormat(L"Segoe UI", 17.0f * ui_, N, DWRITE_FONT_STYLE_ITALIC, true);
+    for (int i = 0; i < bs::kFontCount; ++i) {
+        auto& ff = fontFormats_[static_cast<std::size_t>(i)];
+        if (!ff) ff = makeFormat(bs::fontFamily(i), 15.0f * ui_, N, upright, true);
+    }
+    return shotBitmap_ && brush_ && dashStroke_ && labelFont_ && iconFont_ && glyphFont_ && italicFont_;
 }
 
 bs::Rect CaptureWindow::monitorFor(const bs::Rect& r) const {
@@ -620,38 +882,88 @@ void CaptureWindow::layoutToolbar() {
         int arg;
         bool gapBefore;
     };
-    std::vector<Item> items;
-    for (int t = 1; t <= 7; ++t) items.push_back({Action::Tool, t, false});
-    for (int c = 0; c < kPaletteSize; ++c) items.push_back({Action::Color, c, c == 0});
-    for (int w = 0; w < kWidthCount; ++w) items.push_back({Action::Width, w, false});
-    items.push_back({Action::Undo, 0, true});
-    items.push_back({Action::Redo, 0, false});
-    items.push_back({Action::Cancel, 0, true});
-    items.push_back({Action::Pin, 0, false});
-    items.push_back({Action::Save, 0, false});
-    items.push_back({Action::Copy, 0, false});
-
     const float size = 34.0f * ui_, pad = 6.0f * ui_, gap = 12.0f * ui_;
-    buttons_.clear();
-    float x = pad;
-    for (const auto& it : items) {
-        if (it.gapBefore) x += gap;
-        buttons_.push_back({{x, pad, x + size, pad + size}, it.a, it.arg});
-        x += size;
+    const auto place = [&](const std::vector<Item>& items, float& width) {
+        std::vector<Button> out;
+        float x = pad;
+        for (const auto& it : items) {
+            if (it.gapBefore) x += gap;
+            out.push_back({{x, pad, x + size, pad + size}, it.a, it.arg});
+            x += size;
+        }
+        width = x + pad;
+        return out;
+    };
+    const auto offset = [](std::vector<Button>& bs_, const bs::Rect& r) {
+        for (auto& b : bs_) {
+            b.rect.left += r.left;
+            b.rect.right += r.left;
+            b.rect.top += r.top;
+            b.rect.bottom += r.top;
+        }
+    };
+
+    std::vector<Item> main;
+    for (int t = 1; t < kToolCount; ++t) main.push_back({Action::Tool, t, false});
+    for (int c = 0; c < kPaletteSize; ++c) main.push_back({Action::Color, c, c == 0});
+    for (int w = 0; w < kWidthCount; ++w) main.push_back({Action::Width, w, false});
+    main.push_back({Action::Undo, 0, true});
+    main.push_back({Action::Redo, 0, false});
+    main.push_back({Action::Cancel, 0, true});
+    main.push_back({Action::Pin, 0, false});
+    main.push_back({Action::Save, 0, false});
+    main.push_back({Action::Copy, 0, false});
+
+    float mainW = 0;
+    buttons_ = place(main, mainW);
+    const float h = size + 2.0f * pad;
+    const bs::Rect monitor = monitorFor(sel_);
+    toolbarRect_ = bs::placeToolbar(sel_, mainW, h, monitor, 8.0f * ui_);
+    offset(buttons_, toolbarRect_);
+
+    // Contextual CMF bar for the active tool / picked shape / label being edited.
+    std::vector<Item> sub;
+    if (const auto kind = contextKind()) {
+        const bool box = *kind == bs::ShapeKind::Rect || *kind == bs::ShapeKind::Ellipse || *kind == bs::ShapeKind::Pen;
+        if (box || hasCaps(*kind)) sub.push_back({Action::Finish, 0, false});
+        if (hasCaps(*kind)) {
+            sub.push_back({Action::Head, 0, false});
+            sub.push_back({Action::Tail, 0, false});
+        }
+        if (hasText(*kind)) {
+            const bool g = !sub.empty();
+            sub.push_back({Action::Font, 0, g});
+            sub.push_back({Action::Bold, 0, false});
+            sub.push_back({Action::Italic, 0, false});
+            sub.push_back({Action::List, 0, false});
+            sub.push_back({Action::Plate, 0, false});
+        }
+        if (*kind == bs::ShapeKind::Mosaic) sub.push_back({Action::MosaicMode, 0, false});
     }
-    toolbarRect_ = bs::placeToolbar(sel_, x + pad, size + 2.0f * pad, monitorFor(sel_), 8.0f * ui_);
-    for (auto& b : buttons_) {
-        b.rect.left += toolbarRect_.left;
-        b.rect.right += toolbarRect_.left;
-        b.rect.top += toolbarRect_.top;
-        b.rect.bottom += toolbarRect_.top;
-    }
+    if (picked_ && edit_ == Edit::None) sub.push_back({Action::Delete, 0, !sub.empty()});
+    subRect_ = {};
+    if (sub.empty()) return;
+    float subW = 0;
+    std::vector<Button> subButtons = place(sub, subW);
+    const float g = 6.0f * ui_;
+    const bool below = toolbarRect_.top >= sel_.bottom && toolbarRect_.bottom + g + h <= monitor.bottom;
+    const float top = below ? toolbarRect_.bottom + g : toolbarRect_.top - g - h;
+    const float left = std::max(monitor.left, toolbarRect_.right - subW);
+    subRect_ = {left, std::clamp(top, monitor.top, monitor.bottom - h), left + subW, 0};
+    subRect_.bottom = subRect_.top + h;
+    offset(subButtons, subRect_);
+    buttons_.insert(buttons_.end(), subButtons.begin(), subButtons.end());
 }
 
 void CaptureWindow::paint() {
     if (!hwnd_ || !ensureTarget()) return;
+    const float elapsed = animating_ ? animElapsedMs() : 1e9f;
     rt_->BeginDraw();
-    rt_->SetTransform(D2D1::Matrix3x2F::Identity());
+    rt_->Clear(D2D1::ColorF(0, 0, 0, 1));
+    // Summon jolt: the whole frozen frame kicks and settles.
+    rt_->SetTransform(animating_ ? D2D1::Matrix3x2F::Translation(bs::shakeOffset(elapsed),
+                                                                 bs::shakeOffset(elapsed + 12.0f, 1.5f))
+                                 : D2D1::Matrix3x2F::Identity());
     rt_->DrawBitmap(shotBitmap_.Get(), gfx::toD2D(bounds()), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
 
     const bs::Rect active = activeRect();
@@ -659,30 +971,45 @@ void CaptureWindow::paint() {
     if (!bs::isEmpty(active)) {
         if (mode_ == Mode::Selected) {
             rt_->PushAxisAlignedClip(gfx::toD2D(active), D2D1_ANTIALIAS_MODE_ALIASED);
-            gfx::drawShapes(rt_.Get(), doc_.shapes());
-            if (auto p = previewShape()) gfx::drawShape(rt_.Get(), *p);
+            gfx::drawShapes(rt_.Get(), doc_.shapes(), &grab_.image, hiddenIndex());
+            if (auto p = previewShape()) gfx::drawShape(rt_.Get(), *p, &grab_.image);
             if (edit_ != Edit::None) {
                 const bs::Vec2 o = gfx::textOrigin(editShape_);
-                const D2D1_RECT_F c = gfx::caretRect(editShape_.text, editShape_.fontSize);
-                const D2D1_SIZE_F sz = gfx::measureText(editShape_.text, editShape_.fontSize);
+                const D2D1_RECT_F c = gfx::caretRect(editShape_);
                 brush_->SetColor(kAccent);
-                rt_->DrawRectangle(D2D1::RectF(o.x - 4, o.y - 2, o.x + std::max(sz.width, 8.0f) + 4, o.y + sz.height + 2),
-                                   brush_.Get(), 1.0f);
+                rt_->DrawRectangle(D2D1::RectF(o.x - 4, o.y - 2, o.x + std::max(editShape_.textSize.x, 8.0f) + 4,
+                                               o.y + editShape_.textSize.y + 2),
+                                   brush_.Get(), 1.0f, dashStroke_.Get());
                 brush_->SetColor(gfx::toD2D(editShape_.color));
                 rt_->FillRectangle(D2D1::RectF(o.x + c.left, o.y + c.top, o.x + c.right, o.y + c.bottom), brush_.Get());
             }
             rt_->PopAxisAlignedClip();
+            paintPicked();
         }
         paintSelectionChrome(active);
     }
-    if (mode_ == Mode::Selected && dragHandle_ == bs::Handle::None && !drawing_) paintToolbar();
+    rt_->SetTransform(D2D1::Matrix3x2F::Identity());
+    if (mode_ == Mode::Selected && dragHandle_ == bs::Handle::None && !drawing_ && !pick_.active) paintToolbar();
     if (mode_ != Mode::Selected) paintMagnifier();
+    if (animating_) paintAnimation(elapsed);
 
     if (rt_->EndDraw() == static_cast<HRESULT>(D2DERR_RECREATE_TARGET)) {
         rt_.Reset();
         shotBitmap_.Reset();
         brush_.Reset();
         invalidate();
+    }
+}
+
+void CaptureWindow::paintAnimation(float elapsedMs) {
+    const float maxR = 220.0f * ui_;
+    for (const auto& ring : bs::rippleFrame(elapsedMs, maxR)) {
+        if (ring.opacity <= 0.0f) continue;
+        const auto e = D2D1::Ellipse(gfx::toD2D(cursor_), ring.radius, ring.radius);
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, ring.opacity * 0.18f));
+        rt_->FillEllipse(e, brush_.Get());
+        brush_->SetColor(D2D1::ColorF(kAccent.r, kAccent.g, kAccent.b, ring.opacity));
+        rt_->DrawEllipse(e, brush_.Get(), 2.5f * ui_);
     }
 }
 
@@ -699,6 +1026,88 @@ void CaptureWindow::paintDim(const bs::Rect& s) {
     rt_->FillRectangle(D2D1::RectF(s.right, s.top, b.right, s.bottom), brush_.Get());
 }
 
+void CaptureWindow::paintAngle(bs::Vec2 vertex, bs::Vec2 target) {
+    const bs::Vec2 d = target - vertex;
+    const float len = bs::length(d);
+    if (len < 12.0f * ui_) return;
+    const float deg = bs::inclinationDeg(vertex, target);
+    const float sx = d.x >= 0 ? 1.0f : -1.0f;
+    const float r = std::min(26.0f * ui_, len * 0.6f);
+    const bs::Vec2 u = bs::normalize(d);
+    const bs::Vec2 h{sx, 0.0f};
+
+    // Horizontal reference + arc from it to the segment.
+    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.75f));
+    rt_->DrawLine(gfx::toD2D(vertex), gfx::toD2D(vertex + h * (r + 10.0f * ui_)), brush_.Get(), 1.0f, dashStroke_.Get());
+    if (deg > 0.5f) {
+        ComPtr<ID2D1PathGeometry> path;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (SUCCEEDED(gfx::factories().d2d->CreatePathGeometry(path.GetAddressOf())) &&
+            SUCCEEDED(path->Open(sink.GetAddressOf()))) {
+            sink->BeginFigure(gfx::toD2D(vertex + h * r), D2D1_FIGURE_BEGIN_HOLLOW);
+            // In y-down space a positive cross product means a clockwise turn.
+            const bool cw = sx * u.y > 0.0f;
+            sink->AddArc(D2D1::ArcSegment(gfx::toD2D(vertex + u * r), D2D1::SizeF(r, r), 0.0f,
+                                          cw ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                                          D2D1_ARC_SIZE_SMALL));
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close())) {
+                brush_->SetColor(kAccent);
+                rt_->DrawGeometry(path.Get(), brush_.Get(), 1.5f * ui_);
+            }
+        }
+    }
+
+    wchar_t label[16];
+    if (std::fabs(deg - std::round(deg)) < 0.05f)
+        std::swprintf(label, 16, L"%.0f°", static_cast<double>(deg));
+    else
+        std::swprintf(label, 16, L"%.1f°", static_cast<double>(deg));
+    const bs::Vec2 bis = bs::normalize(h + u);
+    const bs::Vec2 at = vertex + (bis == bs::Vec2{} ? bs::Vec2{0, -1} : bis) * (r + 16.0f * ui_);
+    const float w = 44.0f * ui_, hh = 20.0f * ui_;
+    const auto pill = D2D1::RoundedRect(D2D1::RectF(at.x - w / 2, at.y - hh / 2, at.x + w / 2, at.y + hh / 2), hh / 2, hh / 2);
+    brush_->SetColor(kSurface);
+    rt_->FillRoundedRectangle(pill, brush_.Get());
+    brush_->SetColor(kOnSurface);
+    labelFont_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    labelFont_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    rt_->DrawText(label, static_cast<UINT32>(std::wcslen(label)), labelFont_.Get(), pill.rect, brush_.Get());
+    labelFont_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    labelFont_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+}
+
+void CaptureWindow::paintPicked() {
+    // Angle readouts for whatever leader / segment is being shaped right now.
+    std::optional<bs::Shape> s;
+    if (pick_.active) s = live_;
+    else if (drawing_) s = draft_;
+    else if (edit_ != Edit::None) s = editShape_;
+    else if (tool_ == Tool::MLeader && leader_.phase() != bs::MLeaderTool::Phase::ArrowTip) s = previewShape();
+    else if (picked_ && *picked_ < doc_.shapes().size()) s = doc_.shapes()[*picked_];
+    if (!s) return;
+    if (s->kind == bs::ShapeKind::MLeader) paintAngle(s->leader.kink, s->leader.arrowTip);
+    if (s->kind == bs::ShapeKind::Line || s->kind == bs::ShapeKind::Arrow) paintAngle(s->a, s->b);
+
+    if (!picked_ || drawing_) return;
+    // Joints of the picked shape (or its outline when it only moves as a whole).
+    const auto pts = bs::controlPoints(*s);
+    if (pts.empty() || s->kind == bs::ShapeKind::Mosaic) {
+        const bs::Rect b = bs::shapeBounds(*s);
+        brush_->SetColor(kAccent);
+        rt_->DrawRectangle(D2D1::RectF(b.left - 4, b.top - 4, b.right + 4, b.bottom + 4), brush_.Get(), 1.0f,
+                           dashStroke_.Get());
+    }
+    const float r = 4.5f * ui_;
+    for (const auto& p : pts) {
+        const auto e = D2D1::Ellipse(gfx::toD2D(p), r, r);
+        brush_->SetColor(D2D1::ColorF(D2D1::ColorF::White));
+        rt_->FillEllipse(e, brush_.Get());
+        brush_->SetColor(kAccent);
+        rt_->DrawEllipse(e, brush_.Get(), 1.8f * ui_);
+    }
+}
+
 void CaptureWindow::paintSelectionChrome(const bs::Rect& s) {
     const bool snapping = mode_ == Mode::Picking || (mode_ == Mode::Dragging && bs::isClick(dragStart_, cursor_));
     brush_->SetColor(kAccent);
@@ -709,10 +1118,10 @@ void CaptureWindow::paintSelectionChrome(const bs::Rect& s) {
         const float r = 4.0f * ui_;
         const float xs[] = {s.left, (s.left + s.right) / 2, s.right};
         const float ys[] = {s.top, (s.top + s.bottom) / 2, s.bottom};
-        for (float x : xs)
-            for (float y : ys) {
-                if (x == xs[1] && y == ys[1]) continue;
-                const auto e = D2D1::Ellipse(D2D1::Point2F(x, y), r, r);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                if (i == 1 && j == 1) continue;
+                const auto e = D2D1::Ellipse(D2D1::Point2F(xs[i], ys[j]), r, r);
                 brush_->SetColor(D2D1::ColorF(D2D1::ColorF::White));
                 rt_->FillEllipse(e, brush_.Get());
                 brush_->SetColor(kAccent);
@@ -723,8 +1132,9 @@ void CaptureWindow::paintSelectionChrome(const bs::Rect& s) {
     wchar_t label[48];
     std::swprintf(label, 48, L"%d × %d", static_cast<int>(std::round(s.width())), static_cast<int>(std::round(s.height())));
     const float lw = 92.0f * ui_, lh = 22.0f * ui_;
-    const float ly = s.top - lh - 6.0f * ui_ >= 0 ? s.top - lh - 6.0f * ui_ : s.top + 6.0f * ui_;
-    const float lx = s.left + (s.top - lh - 6.0f * ui_ >= 0 ? 0.0f : 6.0f * ui_);
+    const bool above = s.top - lh - 6.0f * ui_ >= 0;
+    const float ly = above ? s.top - lh - 6.0f * ui_ : s.top + 6.0f * ui_;
+    const float lx = s.left + (above ? 0.0f : 6.0f * ui_);
     const auto pill = D2D1::RoundedRect(D2D1::RectF(lx, ly, lx + lw, ly + lh), lh / 2, lh / 2);
     brush_->SetColor(kSurface);
     rt_->FillRoundedRectangle(pill, brush_.Get());
@@ -736,33 +1146,46 @@ void CaptureWindow::paintSelectionChrome(const bs::Rect& s) {
     labelFont_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 }
 
+bool CaptureWindow::isToggled(const Button& b) const {
+    const bs::Shape& s = styleSource();
+    switch (b.action) {
+        case Action::Tool: return static_cast<int>(tool_) == b.arg;
+        case Action::Bold: return s.textStyle.bold;
+        case Action::Italic: return s.textStyle.italic;
+        case Action::Plate: return s.textStyle.background;
+        case Action::List: return s.textStyle.list != bs::ListStyle::None;
+        default: return false;
+    }
+}
+
 void CaptureWindow::paintToolbar() {
     if (buttons_.empty()) return;
     const float radius = 12.0f * ui_;
-    // Soft elevation: a few widening translucent layers under the surface.
-    for (int i = 3; i >= 1; --i) {
-        const float g = static_cast<float>(i) * 2.0f * ui_;
-        brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.10f));
-        rt_->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(toolbarRect_.left - g, toolbarRect_.top - g + 2 * ui_,
-                                          toolbarRect_.right + g, toolbarRect_.bottom + g + 2 * ui_),
-                              radius + g, radius + g),
-            brush_.Get());
+    for (const bs::Rect* bar : {&toolbarRect_, &subRect_}) {
+        if (bs::isEmpty(*bar)) continue;
+        // Soft elevation: a few widening translucent layers under the surface.
+        for (int i = 3; i >= 1; --i) {
+            const float g = static_cast<float>(i) * 2.0f * ui_;
+            brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.10f));
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bar->left - g, bar->top - g + 2 * ui_, bar->right + g,
+                                                                    bar->bottom + g + 2 * ui_),
+                                                        radius + g, radius + g),
+                                      brush_.Get());
+        }
+        brush_->SetColor(kSurface);
+        rt_->FillRoundedRectangle(D2D1::RoundedRect(gfx::toD2D(*bar), radius, radius), brush_.Get());
     }
-    brush_->SetColor(kSurface);
-    rt_->FillRoundedRectangle(D2D1::RoundedRect(gfx::toD2D(toolbarRect_), radius, radius), brush_.Get());
 
     for (std::size_t i = 0; i < buttons_.size(); ++i) {
         const Button& b = buttons_[i];
         const auto bg = D2D1::RoundedRect(D2D1::RectF(b.rect.left + 2, b.rect.top + 2, b.rect.right - 2, b.rect.bottom - 2),
                                           8.0f * ui_, 8.0f * ui_);
-        const bool activeTool = b.action == Action::Tool && static_cast<int>(tool_) == b.arg;
         D2D1_COLOR_F fg = kOnSurface;
         if (b.action == Action::Copy) {
             brush_->SetColor(kAccent);
             rt_->FillRoundedRectangle(bg, brush_.Get());
             fg = D2D1::ColorF(D2D1::ColorF::White);
-        } else if (activeTool) {
+        } else if (isToggled(b)) {
             brush_->SetColor(kAccentSoft);
             rt_->FillRoundedRectangle(bg, brush_.Get());
         }
@@ -773,6 +1196,32 @@ void CaptureWindow::paintToolbar() {
         if ((b.action == Action::Undo && !doc_.canUndo()) || (b.action == Action::Redo && !doc_.canRedo())) fg = kMuted;
         paintButtonIcon(b, fg);
     }
+}
+
+void CaptureWindow::paintCapSample(D2D1_POINT_2F c, bs::EndShape shape, bool atRight) {
+    const float u = ui_;
+    const bs::Vec2 l{c.x - 10 * u, c.y}, r{c.x + 10 * u, c.y};
+    const bs::Vec2 tip = atRight ? r : l, from = atRight ? l : r;
+    const auto cap = bs::makeEndCap(shape, from, tip, 0.4f * u);
+    rt_->DrawLine(gfx::toD2D(from), gfx::toD2D(cap.shaftEnd), brush_.Get(), 1.5f * u);
+    if (cap.shape == bs::EndShape::Dot) {
+        rt_->FillEllipse(D2D1::Ellipse(gfx::toD2D(cap.center), cap.radius, cap.radius), brush_.Get());
+    } else if (cap.outline.size() >= 2) {
+        ComPtr<ID2D1PathGeometry> path;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (SUCCEEDED(gfx::factories().d2d->CreatePathGeometry(path.GetAddressOf())) &&
+            SUCCEEDED(path->Open(sink.GetAddressOf()))) {
+            sink->BeginFigure(gfx::toD2D(cap.outline[0]), cap.filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
+            for (std::size_t i = 1; i < cap.outline.size(); ++i) sink->AddLine(gfx::toD2D(cap.outline[i]));
+            sink->EndFigure(cap.closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+            if (SUCCEEDED(sink->Close())) {
+                if (cap.filled) rt_->FillGeometry(path.Get(), brush_.Get());
+                else rt_->DrawGeometry(path.Get(), brush_.Get(), 1.5f * u);
+            }
+        }
+    }
+    // Small marker on the far end tells head (●→) from tail (←●) apart.
+    rt_->FillEllipse(D2D1::Ellipse(gfx::toD2D(from), 1.6f * u, 1.6f * u), brush_.Get());
 }
 
 void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
@@ -786,6 +1235,7 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
     auto line = [&](float x0, float y0, float x1, float y1) {
         rt_->DrawLine(D2D1::Point2F(c.x + x0 * u, c.y + y0 * u), D2D1::Point2F(c.x + x1 * u, c.y + y1 * u), brush_.Get(), sw);
     };
+    const bs::Shape& style = styleSource();
 
     switch (b.action) {
         case Action::Tool:
@@ -828,6 +1278,16 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
                     line(-2, -3, 9, -3);
                     rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x - 8 * u, c.y + 7 * u), 2.2f * u, 2.2f * u), brush_.Get());
                     break;
+                case Tool::Mosaic:
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j)
+                            if ((i + j) % 2 == 0)
+                                rt_->FillRectangle(D2D1::RectF(c.x + (static_cast<float>(i) * 5 - 7.5f) * u,
+                                                               c.y + (static_cast<float>(j) * 5 - 7.5f) * u,
+                                                               c.x + (static_cast<float>(i) * 5 - 2.5f) * u,
+                                                               c.y + (static_cast<float>(j) * 5 - 2.5f) * u),
+                                                   brush_.Get());
+                    break;
                 case Tool::None:
                     break;
             }
@@ -852,6 +1312,72 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
             }
             break;
         }
+        case Action::Finish: {
+            ComPtr<ID2D1StrokeStyle> st;
+            const D2D1_DASH_STYLE dash[] = {D2D1_DASH_STYLE_SOLID, D2D1_DASH_STYLE_DASH, D2D1_DASH_STYLE_DOT,
+                                            D2D1_DASH_STYLE_DASH_DOT};
+            gfx::factories().d2d->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
+                                            D2D1_LINE_JOIN_ROUND, 10.0f, dash[static_cast<int>(style.finish)]),
+                nullptr, 0, st.GetAddressOf());
+            rt_->DrawLine(D2D1::Point2F(c.x - 11 * u, c.y), D2D1::Point2F(c.x + 11 * u, c.y), brush_.Get(), 2.0f * u, st.Get());
+            break;
+        }
+        case Action::Head: paintCapSample(c, style.head, true); break;
+        case Action::Tail: paintCapSample(c, style.tail, false); break;
+        case Action::Font: {
+            const auto& f = fontFormats_[static_cast<std::size_t>(std::clamp(style.textStyle.font, 0, bs::kFontCount - 1))];
+            const std::wstring label = bs::fontLabel(style.textStyle.font);
+            rt_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), f.Get(),
+                          D2D1::RectF(b.rect.left - 6 * u, b.rect.top, b.rect.right + 6 * u, b.rect.bottom), brush_.Get());
+            break;
+        }
+        case Action::Bold: glyph(L"B", glyphFont_.Get()); break;
+        case Action::Italic: glyph(L"I", italicFont_.Get()); break;
+        case Action::List: {
+            for (int i = 0; i < 3; ++i) {
+                const float y = c.y + (static_cast<float>(i) - 1.0f) * 5.5f * u;
+                line(-2, (y - c.y) / u, 9, (y - c.y) / u);
+            }
+            if (style.textStyle.list == bs::ListStyle::Numbered) {
+                rt_->DrawText(L"1\n2\n3", 5, labelFont_.Get(), D2D1::RectF(c.x - 10 * u, c.y - 9 * u, c.x - 2 * u, c.y + 10 * u),
+                              brush_.Get());
+            } else {
+                for (int i = 0; i < 3; ++i)
+                    rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x - 6 * u, c.y + (static_cast<float>(i) - 1.0f) * 5.5f * u),
+                                                   1.6f * u, 1.6f * u),
+                                     brush_.Get());
+            }
+            break;
+        }
+        case Action::Plate:
+            brush_->SetColor(D2D1::ColorF(fg.r, fg.g, fg.b, 0.35f));
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 10 * u, c.y - 8 * u, c.x + 10 * u, c.y + 8 * u),
+                                                        3 * u, 3 * u),
+                                      brush_.Get());
+            brush_->SetColor(fg);
+            glyph(L"A", glyphFont_.Get());
+            break;
+        case Action::MosaicMode:
+            if (style.mosaic == bs::MosaicMode::Pixelate) {
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 4; ++j) {
+                        brush_->SetColor(D2D1::ColorF(fg.r, fg.g, fg.b, (i + j) % 2 ? 0.9f : 0.3f));
+                        rt_->FillRectangle(D2D1::RectF(c.x + (static_cast<float>(i) * 4 - 8) * u,
+                                                       c.y + (static_cast<float>(j) * 4 - 8) * u,
+                                                       c.x + (static_cast<float>(i) * 4 - 4) * u,
+                                                       c.y + (static_cast<float>(j) * 4 - 4) * u),
+                                           brush_.Get());
+                    }
+            } else {
+                for (int i = 3; i >= 1; --i) {
+                    brush_->SetColor(D2D1::ColorF(fg.r, fg.g, fg.b, 0.25f));
+                    rt_->FillEllipse(D2D1::Ellipse(c, static_cast<float>(i) * 3.2f * u, static_cast<float>(i) * 3.2f * u),
+                                     brush_.Get());
+                }
+            }
+            break;
+        case Action::Delete: glyph(L"", iconFont_.Get()); break;
         case Action::Undo: glyph(L"", iconFont_.Get()); break;
         case Action::Redo: glyph(L"", iconFont_.Get()); break;
         case Action::Pin: glyph(L"", iconFont_.Get()); break;
@@ -922,34 +1448,83 @@ bool CaptureWindow::smoke(const bs::Rect& r) {
     if (!hwnd_) return false;
     sel_ = bs::intersect(r, bounds());
     if (bs::isEmpty(sel_)) return false;
+    if (opts_.animate) {
+        paint();  // mid-animation frame: ripple + shake
+        animStart_ -= 1000000000LL;
+        animating_ = false;
+    }
     paint();  // picking frame: dim + magnifier
     mode_ = Mode::Selected;
     layoutToolbar();
 
     const bs::Vec2 o{sel_.left, sel_.top};
-    for (int t = 1; t <= 5; ++t) {
-        bs::Shape s = styledShape(kindFor(t));
-        s.a = o + bs::Vec2{10.0f, 10.0f};
-        s.b = o + bs::Vec2{60.0f, 50.0f};
-        s.points = {s.a, o + bs::Vec2{30, 40}, s.b};
-        doc_.add(s);
+    // Every drag tool in its own column (so no stroke lands on an earlier shape),
+    // each with a different CMF finish.
+    float column = 10.0f;
+    for (int t = 1; t <= 8; ++t) {
+        if (t == 6 || t == 7) continue;  // text tools below
+        tool_ = static_cast<Tool>(t);
+        if (t == 8) run(Action::MosaicMode, 0, +1);  // blur
+        run(Action::Finish, 0, +1);
+        const bs::Vec2 a = o + bs::Vec2{column, 10.0f}, b = a + bs::Vec2{30.0f, 40.0f};
+        onLButtonDown(a);
+        onMouseMove(b, t == 1);
+        onLButtonUp(b, t == 1);
+        column += 40.0f;
+        tool_ = Tool::None;
     }
+    if (doc_.shapes().size() != 6) return false;
+
+    // Text with font / bold / italic / numbered list / backing plate.
     tool_ = Tool::Text;
-    beginEdit(Edit::Text, o + bs::Vec2{20, 80});
-    for (wchar_t ch : std::wstring(L"Boringshot 标注")) onChar(ch);
+    beginEdit(Edit::Text, o + bs::Vec2{20, 100});
+    run(Action::Font, 0, +1);
+    run(Action::Italic, 0, +1);
+    run(Action::List, 0, -1);  // None → Numbered
+    run(Action::Plate, 0, +1);
+    for (wchar_t ch : std::wstring(L"第一\r")) onChar(ch == L'\r' ? L'x' : ch);
+    editShape_.text += L"\n* 要点";
     commitEdit();
+    const bs::Shape& text = doc_.shapes().back();
+    if (text.textStyle.list != bs::ListStyle::Numbered || !text.textStyle.italic || text.textSize.x <= 0) return false;
+
+    // MLEADER with caps on both ends, then pick it and drag its kink.
     tool_ = Tool::MLeader;
-    leader_.click(o + bs::Vec2{5, 5});
-    leader_.click(o + bs::Vec2{40, 30});
-    leader_.click(o + bs::Vec2{90, 30});
+    run(Action::Tail, 0, +1);
+    leader_.click(o + bs::Vec2{5, 120});
+    leader_.click(o + bs::Vec2{60, 90});
+    leader_.click(o + bs::Vec2{150, 90});
     beginEdit(Edit::LeaderLabel, o);
     onChar(L'A');
     commitEdit();
+    tool_ = Tool::None;
+    const std::size_t li = doc_.shapes().size() - 1;
+    const bs::Vec2 kink = doc_.shapes()[li].leader.kink;
+    onLButtonDown(kink);  // picks the leader body
+    onLButtonUp(kink, false);
+    if (picked_ != li) return false;
+    onLButtonDown(kink);  // now the kink joint
+    onMouseMove(kink + bs::Vec2{10, -10}, false);
+    paint();  // angle readout while dragging
+    onLButtonUp(kink + bs::Vec2{10, -10}, false);
+    if (!(doc_.shapes()[li].leader.kink == kink + bs::Vec2{10, -10})) return false;
+    run(Action::Head, 0, +1);  // restyle the picked shape
+    paint();
 
+    // Double-click edits the label in place; Delete removes; undo restores.
+    const std::size_t count = doc_.shapes().size();
+    beginEditExisting(li);
+    onChar(L'B');
+    commitEdit();
+    if (doc_.shapes()[li].text != L"AB") return false;
+    picked_ = li;
+    deletePicked();
+    if (doc_.shapes().size() != count - 1) return false;
     doc_.undo();
-    doc_.redo();
+    if (doc_.shapes().size() != count) return false;
+
     paint();
     const gfx::Image img = composite();
-    return doc_.shapes().size() == 7 && img.width == static_cast<int>(std::round(sel_.width())) &&
+    return img.width == static_cast<int>(std::round(sel_.width())) &&
            img.height == static_cast<int>(std::round(sel_.height()));
 }
