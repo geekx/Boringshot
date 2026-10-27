@@ -31,7 +31,11 @@ add_library(boringshot_core STATIC
   core/src/selection.cpp
   core/src/color.cpp
   core/src/annotation.cpp
-  core/src/pin.cpp)
+  core/src/pin.cpp
+  core/src/shape_edit.cpp
+  core/src/image_ops.cpp
+  core/src/anim.cpp
+  core/src/config.cpp)
 target_include_directories(boringshot_core PUBLIC core/include)
 target_link_libraries(boringshot_core PRIVATE bs_warnings)
 
@@ -43,7 +47,12 @@ if(BORINGSHOT_BUILD_TESTS)
     tests/test_command_stack.cpp
     tests/test_watermark.cpp
     tests/test_selection.cpp
-    tests/test_annotation.cpp)
+    tests/test_annotation.cpp
+    tests/test_style.cpp
+    tests/test_shape_edit.cpp
+    tests/test_image_ops.cpp
+    tests/test_anim.cpp
+    tests/test_config.cpp)
   target_link_libraries(boringshot_tests PRIVATE boringshot_core bs_warnings)
   add_test(NAME core COMMAND boringshot_tests)
 endif()
