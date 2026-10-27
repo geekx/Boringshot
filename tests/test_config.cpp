@@ -112,3 +112,19 @@ TEST(config_presets) {
     CHECK(spacingPresetIndex(d.watermarkProfile.tileSpacingX, d.watermarkProfile.tileSpacingY) == 1);
     CHECK(colorPresetIndex(d.watermarkProfile.colorR, d.watermarkProfile.colorG, d.watermarkProfile.colorB) == 0);
 }
+
+TEST(config_validate_duplicates) {
+    Config c;
+    CHECK(validateConfig(c).empty());
+    c.watermark = c.capture;
+    const auto p = validateConfig(c);
+    CHECK(p.size() == 1 && p[0].find(L"F1") != std::wstring::npos);
+    Config off;
+    off.capture = {};
+    off.captureAlt = {};
+    CHECK(validateConfig(off).size() == 1);  // warns that only the tray can capture
+    Config none;
+    none.capture = {};
+    none.watermark = {};
+    CHECK(validateConfig(none).empty());  // disabled keys never collide
+}

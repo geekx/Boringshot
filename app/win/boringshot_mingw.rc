@@ -1,0 +1,2 @@
+// MinGW sanity builds embed the manifest via windres; MSVC merges boringshot.manifest itself.
+1 24 "boringshot.manifest"

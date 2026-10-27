@@ -6,14 +6,14 @@
 
 #include "boringshot/config.h"
 
-// %APPDATA%\Boringshot\config.ini (UTF-8). Parsing lives in core (bs::parseConfig).
-std::wstring defaultConfigPath();
+// Settings live in the registry (HKCU\Software\Boringshot, value "Config", the
+// serializeConfig text) — no files, so disk-encryption / DLP agents can't
+// mangle them. Parsing stays in core (bs::parseConfig / bs::serializeConfig).
+inline constexpr wchar_t kSettingsKey[] = L"Software\\Boringshot";
 
-// Reads and parses `path`; writes the default file first when missing.
-bs::Config loadConfig(const std::wstring& path, bool createIfMissing);
-
-// Last-write stamp for cheap change polling (0 if the file is missing).
-ULONGLONG configStamp(const std::wstring& path);
+bs::Config loadSettings(const wchar_t* subKey = kSettingsKey);
+bool saveSettings(const bs::Config& c, const wchar_t* subKey = kSettingsKey);
+void deleteSettings(const wchar_t* subKey);  // smoke-test cleanup
 
 std::wstring utf8ToWide(const std::string& s);
 std::string wideToUtf8(const std::wstring& s);

@@ -2,10 +2,12 @@
 // hotkeys, the capture overlay, pinned images and the click-through watermark.
 
 #include <windows.h>
+#include <commctrl.h>
 #include <objbase.h>
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cwchar>
 #include <memory>
@@ -15,6 +17,7 @@
 #include "capture_window.h"
 #include "pin_window.h"
 #include "settings.h"
+#include "settings_dialog.h"
 #include "watermark_overlay.h"
 #ifdef BORINGSHOT_HAS_WGC
 #include "capture_wgc.h"
@@ -32,10 +35,8 @@ constexpr int kHotkeyCaptureAlt = 2;
 constexpr int kHotkeyWatermark = 3;
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT kClockIntervalMs = 15000;  // {time} has minute granularity
-constexpr UINT_PTR kConfigTimer = 2;
-constexpr UINT kConfigPollMs = 1500;      // config.ini edits apply on save
 
-enum : UINT { kCmdCapture = 100, kCmdToggleWatermark, kCmdClosePins, kCmdSettings, kCmdReload, kCmdExit };
+enum : UINT { kCmdCapture = 100, kCmdToggleWatermark, kCmdClosePins, kCmdSettings, kCmdExit };
 
 HINSTANCE g_instance = nullptr;
 HWND g_host = nullptr;
@@ -44,9 +45,8 @@ WatermarkOverlay g_overlay;
 std::unique_ptr<CaptureWindow> g_capture;
 bool g_captureClosed = false;
 std::vector<std::unique_ptr<PinWindow>> g_pins;
-std::wstring g_configPath;
-ULONGLONG g_configStamp = 0;
 bs::Config g_config;
+SettingsDialog g_settings;
 
 void addTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid{};
@@ -130,17 +130,27 @@ std::vector<std::wstring> registerHotkeys() {
     return failed;
 }
 
-void applyConfig(bool announce) {
-    g_config = loadConfig(g_configPath, true);
-    g_configStamp = configStamp(g_configPath);
+void applyConfig(const bs::Config& c) {
+    g_config = c;
     g_overlay.updateProfile(g_config.watermarkProfile);
     const auto failed = registerHotkeys();
     addTrayIcon(g_host);
     std::wstring problems;
-    for (const auto& f : failed) problems += L"热键 " + f + L" 已被其他程序占用\n";
-    for (const auto& w : g_config.warnings) problems += L"config.ini " + w + L"\n";
+    for (const auto& f : failed) problems += L"热键 " + f + L" 已被其他程序占用，请在设置里换一个\n";
+    for (const auto& w : g_config.warnings) problems += L"设置 " + w + L"\n";
     if (!problems.empty()) notify(L"Boringshot 设置", problems);
-    else if (announce) notify(L"Boringshot", L"设置已重新加载");
+}
+
+void openSettings() {
+    g_settings.open(g_instance, g_config, [](const bs::Config& c) {
+        if (!saveSettings(c)) {
+            MessageBoxW(g_settings.hwnd(), L"无法写入注册表（HKCU\\Software\\Boringshot）。", L"Boringshot 设置",
+                        MB_OK | MB_ICONERROR);
+            return false;
+        }
+        applyConfig(c);
+        return true;
+    });
 }
 
 void toggleWatermark() { g_overlay.enable(!g_overlay.enabled()); }
@@ -154,8 +164,7 @@ void showTrayMenu(HWND hwnd) {
                 watermark.c_str());
     AppendMenuW(menu, MF_STRING | (g_pins.empty() ? MF_GRAYED : 0u), kCmdClosePins, L"关闭全部贴图");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kCmdSettings, L"设置…（config.ini，保存即生效）");
-    AppendMenuW(menu, MF_STRING, kCmdReload, L"重新加载设置");
+    AppendMenuW(menu, MF_STRING, kCmdSettings, L"设置…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, L"退出");
     POINT pt{};
@@ -186,11 +195,7 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case kCmdClosePins:
                     for (auto& p : g_pins) p->close();
                     break;
-                case kCmdSettings:
-                    loadConfig(g_configPath, true);  // make sure the file exists
-                    ShellExecuteW(hwnd, L"open", g_configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                    break;
-                case kCmdReload: applyConfig(true); break;
+                case kCmdSettings: openSettings(); break;
                 case kCmdExit: DestroyWindow(hwnd); break;
                 default: break;
             }
@@ -203,7 +208,6 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_TIMER:
             if (wp == kClockTimer && g_overlay.enabled()) g_overlay.refresh(false);
-            if (wp == kConfigTimer && configStamp(g_configPath) != g_configStamp) applyConfig(true);
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -211,12 +215,12 @@ LRESULT CALLBACK hostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kClockTimer);
-            KillTimer(hwnd, kConfigTimer);
             UnregisterHotKey(hwnd, kHotkeyCapture);
             UnregisterHotKey(hwnd, kHotkeyCaptureAlt);
             UnregisterHotKey(hwnd, kHotkeyWatermark);
             removeTrayIcon(hwnd);
             if (g_capture) g_capture->close();
+            g_settings.close();
             for (auto& p : g_pins) p->close();
             g_overlay.destroy();
             PostQuitMessage(0);
@@ -240,17 +244,35 @@ void smokeLog(const std::wstring& step) {
 // Non-zero = which step failed.
 int runSmoke(HINSTANCE instance) {
     smokeLog(L"settings");
-    wchar_t tmp[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tmp);
-    const std::wstring cfgPath = std::wstring(tmp) + L"boringshot-smoke-" + std::to_wstring(GetCurrentProcessId()) +
-                                 L"\\config.ini";
-    const bs::Config created = loadConfig(cfgPath, true);   // writes the default file
-    const bs::Config reread = loadConfig(cfgPath, false);   // parses it back (UTF-8 + BOM)
-    const bool settingsOk = configStamp(cfgPath) != 0 && reread.warnings.empty() &&
-                            reread.capture == created.capture && reread.watermarkProfile.text == created.watermarkProfile.text;
-    DeleteFileW(cfgPath.c_str());
-    RemoveDirectoryW(cfgPath.substr(0, cfgPath.find_last_of(L'\\')).c_str());
-    if (!settingsOk) return 9;
+    {
+        constexpr wchar_t kSmokeKey[] = L"Software\\Boringshot.Smoke";
+        bs::Config c;
+        c.capture = {bs::kModCtrl | bs::kModShift, 'X'};
+        c.backend = bs::CaptureBackend::Gdi;
+        c.animation = false;
+        c.watermarkProfile.text = L"评审 {user}";
+        c.watermarkProfile.opacity = 0.3f;
+        c.watermarkProfile.rotationDeg = -45;
+        if (!saveSettings(c, kSmokeKey)) return 9;
+        const bs::Config r = loadSettings(kSmokeKey);
+        deleteSettings(kSmokeKey);
+        if (!r.warnings.empty() || !(r.capture == c.capture) || r.backend != c.backend || r.animation ||
+            r.watermarkProfile.text != c.watermarkProfile.text)
+            return 9;
+
+        // Settings window: populate → collect round-trips every control.
+        SettingsDialog dlg;
+        if (!dlg.open(instance, c, [](const bs::Config&) { return true; })) return 10;
+        const bs::Config back = dlg.collect();
+        dlg.close();
+        const auto& w = back.watermarkProfile;
+        if (!(back.capture == c.capture) || !(back.captureAlt == c.captureAlt) || back.backend != c.backend ||
+            back.animation || w.text != c.watermarkProfile.text || std::fabs(w.opacity - 0.3f) > 1e-4f ||
+            std::fabs(w.rotationDeg + 45.0f) > 1e-4f || w.fontFamily != c.watermarkProfile.fontFamily) {
+            smokeLog(L"settings window round-trip mismatch");
+            return 10;
+        }
+    }
 
     smokeLog(L"watermark");
     WatermarkOverlay overlay;
@@ -308,6 +330,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return 1;
     g_instance = instance;
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_HOTKEY_CLASS | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES};
+    InitCommonControlsEx(&icc);
     if (cmdLine && std::wcsstr(cmdLine, L"--smoke")) {
         const int rc = runSmoke(instance);
         gfx::shutdown();
@@ -336,13 +360,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     }
 
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    g_configPath = defaultConfigPath();
-    applyConfig(false);
+    applyConfig(loadSettings());
     SetTimer(g_host, kClockTimer, kClockIntervalMs, nullptr);
-    SetTimer(g_host, kConfigTimer, kConfigPollMs, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (g_settings.isOpen() && IsDialogMessageW(g_settings.hwnd(), &msg)) continue;  // Tab / Enter / Esc
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

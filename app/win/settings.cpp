@@ -1,7 +1,5 @@
 #include "settings.h"
 
-#include <shlobj.h>
-
 #include <vector>
 
 std::wstring utf8ToWide(const std::string& s) {
@@ -20,55 +18,21 @@ std::string wideToUtf8(const std::wstring& s) {
     return out;
 }
 
-std::wstring defaultConfigPath() {
-    PWSTR appData = nullptr;
-    std::wstring path;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) path = appData;
-    CoTaskMemFree(appData);
-    return path.empty() ? L"config.ini" : path + L"\\Boringshot\\config.ini";
-}
-
-namespace {
-
-bool writeFile(const std::wstring& path, const std::string& bytes) {
-    const std::size_t slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) SHCreateDirectoryExW(nullptr, path.substr(0, slash).c_str(), nullptr);
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const BOOL ok = WriteFile(f, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
-    CloseHandle(f);
-    return ok && written == bytes.size();
-}
-
-bool readFile(const std::wstring& path, std::string& out) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER size{};
-    bool ok = GetFileSizeEx(f, &size) && size.QuadPart < (1 << 20);  // a config is never megabytes
-    if (ok) {
-        out.resize(static_cast<std::size_t>(size.QuadPart));
-        DWORD read = 0;
-        ok = out.empty() || (ReadFile(f, out.data(), static_cast<DWORD>(out.size()), &read, nullptr) && read == out.size());
-    }
-    CloseHandle(f);
-    return ok;
-}
-
-}  // namespace
-
-bs::Config loadConfig(const std::wstring& path, bool createIfMissing) {
-    std::string bytes;
-    if (!readFile(path, bytes)) {
-        if (createIfMissing) writeFile(path, "\xEF\xBB\xBF" + wideToUtf8(bs::defaultConfigText()));
+bs::Config loadSettings(const wchar_t* subKey) {
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, subKey, L"Config", RRF_RT_REG_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        bytes < sizeof(wchar_t))
         return bs::parseConfig(bs::defaultConfigText());
-    }
-    return bs::parseConfig(utf8ToWide(bytes));  // a BOM decodes to U+FEFF, which the parser skips
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 1, L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, subKey, L"Config", RRF_RT_REG_SZ, nullptr, buf.data(), &bytes) != ERROR_SUCCESS)
+        return bs::parseConfig(bs::defaultConfigText());
+    return bs::parseConfig(buf.data());
 }
 
-ULONGLONG configStamp(const std::wstring& path) {
-    WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return 0;
-    return (static_cast<ULONGLONG>(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime;
+bool saveSettings(const bs::Config& c, const wchar_t* subKey) {
+    const std::wstring text = bs::serializeConfig(c);
+    return RegSetKeyValueW(HKEY_CURRENT_USER, subKey, L"Config", REG_SZ, text.c_str(),
+                           static_cast<DWORD>((text.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
+
+void deleteSettings(const wchar_t* subKey) { RegDeleteTreeW(HKEY_CURRENT_USER, subKey); }

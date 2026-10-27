@@ -65,6 +65,9 @@ inline constexpr SpacingPreset kWatermarkSpacings[] = {
     {L"紧凑", 240, 140}, {L"标准", 320, 180}, {L"宽松", 420, 240}};
 int spacingPresetIndex(float x, float y);
 
+// Problems a user should fix before saving (e.g. one hotkey bound twice).
+std::vector<std::wstring> validateConfig(const Config& c);
+
 // "#RRGGBB" → 0..1 channels.
 bool parseHexColor(const std::wstring& text, float& r, float& g, float& b);
 

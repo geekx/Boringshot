@@ -65,13 +65,15 @@ if(WIN32)
     app/win/capture_window.cpp
     app/win/pin_window.cpp
     app/win/settings.cpp
+    app/win/settings_dialog.cpp
     app/win/watermark_overlay.cpp)
   target_compile_definitions(boringshot PRIVATE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00
     BORINGSHOT_VERSION="${PROJECT_VERSION}")
   target_link_libraries(boringshot PRIVATE boringshot_core bs_warnings
-    d2d1 dwrite windowscodecs ole32 shell32 user32 gdi32 advapi32 comdlg32 dwmapi imm32)
+    d2d1 dwrite windowscodecs ole32 shell32 user32 gdi32 advapi32 comdlg32 comctl32 dwmapi imm32)
   if(MSVC)
+    target_sources(boringshot PRIVATE app/win/boringshot.manifest)
     # Windows.Graphics.Capture via C++/WinRT (SDK headers); GDI remains the fallback.
     target_sources(boringshot PRIVATE app/win/capture_wgc.cpp)
     target_compile_definitions(boringshot PRIVATE BORINGSHOT_HAS_WGC)
@@ -80,6 +82,8 @@ if(WIN32)
       COMPILE_OPTIONS "/bigobj;/external:anglebrackets;/external:W0")
   endif()
   if(MINGW)  # cross-compile sanity builds (CI ships MSVC)
+    enable_language(RC)
+    target_sources(boringshot PRIVATE app/win/boringshot_mingw.rc)
     target_link_options(boringshot PRIVATE -municode -static)
   endif()
   if(BORINGSHOT_BUILD_TESTS)

@@ -44,7 +44,7 @@ private:
     static constexpr int kToolCount = 9;
     enum class Action {
         Tool, Color, Width, Undo, Redo, Pin, Save, Copy, Cancel,
-        Finish, Head, Tail, Font, Bold, Italic, List, Plate, MosaicMode, Delete
+        Finish, Head, Tail, Font, Bold, Italic, List, Plate, MosaicMode, Delete, Newline
     };
     struct Button {
         bs::Rect rect;
@@ -52,6 +52,13 @@ private:
         int arg;
     };
     enum class Edit { None, Text, LeaderLabel };
+    // In-overlay dropdown for one style option (icon + label rows).
+    struct Menu {
+        bool open = false;
+        Action action = Action::Finish;
+        bs::Rect rect{};
+        int hover = -1;
+    };
     struct PickDrag {
         bool active = false;
         int handle = -1;  // -1 = move the whole shape
@@ -74,6 +81,14 @@ private:
 
     // Actions & styles
     void run(Action a, int arg, int dir);
+    static bool isMenuAction(Action a);
+    int styleValue(Action a) const;
+    void setStyleValue(Action a, int value);
+    static int optionCount(Action a);
+    std::wstring optionLabel(Action a, int value) const;
+    std::wstring tooltipFor(const Button& b) const;
+    void openMenu(const Button& b);
+    int menuRowAt(bs::Vec2 p) const;
     void selectTool(Tool t);
     void applyStyle(const std::function<void(bs::Shape&)>& fn);
     const bs::Shape& styleSource() const;
@@ -104,6 +119,9 @@ private:
     void paintAnimation(float elapsedMs);
     void paintButtonIcon(const Button& b, D2D1_COLOR_F fg);
     void paintCapSample(D2D1_POINT_2F c, bs::EndShape shape, bool atRight);
+    void paintOptionIcon(Action a, int value, D2D1_POINT_2F c, D2D1_COLOR_F fg);
+    void paintMenu();
+    void paintTooltip();
     bool isToggled(const Button& b) const;
     void layoutToolbar();
     bs::Rect monitorFor(const bs::Rect& r) const;
@@ -155,6 +173,8 @@ private:
     bs::Rect toolbarRect_{};
     bs::Rect subRect_{};
     int hoverButton_ = -1;
+    int tipButton_ = -1;  // tooltip shown after a short hover
+    Menu menu_;
     int pressedButton_ = -1;
 
     Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> rt_;

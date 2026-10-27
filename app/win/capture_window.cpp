@@ -16,6 +16,8 @@ namespace {
 
 constexpr wchar_t kClassName[] = L"Boringshot.Capture";
 constexpr UINT_PTR kAnimTimer = 1;
+constexpr UINT_PTR kTipTimer = 2;
+constexpr UINT kTipDelayMs = 450;
 
 const bs::Color kPalette[] = {
     {1.00f, 0.30f, 0.31f, 1.0f},  // red
@@ -26,6 +28,10 @@ const bs::Color kPalette[] = {
     {0.10f, 0.10f, 0.10f, 1.0f},  // ink
 };
 constexpr int kPaletteSize = 6;
+constexpr int kFrostedSwatch = kPaletteSize;  // 7th swatch: frosted-glass material
+constexpr int kSwatchCount = kPaletteSize + 1;
+const wchar_t* const kSwatchNames[kSwatchCount] = {L"红色", L"琥珀", L"绿色", L"蓝色", L"白色", L"墨黑",
+                                                    L"毛玻璃材质（模糊背景 + 1–2px 柔边；引线圆点头会变成透镜）"};
 constexpr float kWidths[] = {2.0f, 4.0f, 8.0f};
 constexpr float kFontSizes[] = {16.0f, 22.0f, 32.0f};
 constexpr int kWidthCount = 3;
@@ -173,6 +179,11 @@ LRESULT CaptureWindow::handle(UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_TIMER:
+            if (wp == kTipTimer) {
+                KillTimer(hwnd_, kTipTimer);
+                if (hoverButton_ >= 0 && !menu_.open) tipButton_ = hoverButton_;
+                invalidate();
+            }
             if (wp == kAnimTimer) {
                 if (animElapsedMs() >= bs::rippleTotalMs()) {
                     animating_ = false;
@@ -264,7 +275,9 @@ int CaptureWindow::buttonAt(bs::Vec2 p) const {
 
 bs::Shape CaptureWindow::styledShape(Tool t) const {
     bs::Shape s = templates_[static_cast<std::size_t>(t)];
-    s.color = kPalette[colorIndex_];
+    const bool frosted = colorIndex_ == kFrostedSwatch;
+    s.material = frosted ? bs::Material::Frosted : bs::Material::Solid;
+    s.color = frosted ? bs::Color{1, 1, 1, 1} : kPalette[colorIndex_];
     s.strokeWidth = kWidths[widthIndex_];
     s.fontSize = kFontSizes[widthIndex_];
     return s;
@@ -331,7 +344,13 @@ void CaptureWindow::onMouseMove(bs::Vec2 p, bool shift) {
                 leader_.setSnap(!shift);  // 45° snapping by default, Shift for free angles
                 leader_.pointerMove(clamped);
             }
-            hoverButton_ = buttonAt(p);
+            if (menu_.open) menu_.hover = menuRowAt(p);
+            if (const int hb = buttonAt(p); hb != hoverButton_) {  // restart the tooltip delay
+                hoverButton_ = hb;
+                tipButton_ = -1;
+                KillTimer(hwnd_, kTipTimer);
+                if (hb >= 0 && !menu_.open) SetTimer(hwnd_, kTipTimer, kTipDelayMs, nullptr);
+            }
             break;
         }
     }
@@ -349,6 +368,13 @@ void CaptureWindow::onLButtonDown(bs::Vec2 p) {
         return;
     }
     if (mode_ != Mode::Selected) return;
+    tipButton_ = -1;
+    if (menu_.open) {  // a click picks a row or just closes the menu
+        if (const int row = menuRowAt(p); row >= 0) setStyleValue(menu_.action, row);
+        menu_.open = false;
+        invalidate();
+        return;
+    }
 
     if (const int b = buttonAt(p); b >= 0) {  // style buttons act on the text being edited
         pressedButton_ = b;
@@ -419,7 +445,12 @@ void CaptureWindow::onLButtonUp(bs::Vec2 p, bool shift) {
         pressedButton_ = -1;
         if (buttonAt(p) == b) {
             const Button btn = buttons_[static_cast<std::size_t>(b)];
-            run(btn.action, btn.arg, +1);  // may close the window
+            if (isMenuAction(btn.action)) {
+                openMenu(btn);
+                invalidate();
+            } else {
+                run(btn.action, btn.arg, +1);  // may close the window
+            }
         }
         return;
     }
@@ -456,15 +487,20 @@ void CaptureWindow::onDoubleClick(bs::Vec2 p) {
 }
 
 void CaptureWindow::onRButtonUp(bs::Vec2 p) {
-    if (const int b = buttonAt(p); b >= 0) {  // right-click cycles a style backwards
+    if (menu_.open) {
+        menu_.open = false;
+        invalidate();
+        return;
+    }
+    if (const int b = buttonAt(p); b >= 0) {  // right-click cycles a style forward without the menu
         const Button btn = buttons_[static_cast<std::size_t>(b)];
-        if (btn.action >= Action::Finish && btn.action <= Action::MosaicMode) {
-            run(btn.action, btn.arg, -1);
+        if (isMenuAction(btn.action)) {
+            run(btn.action, btn.arg, +1);
             return;
         }
     }
     if (edit_ != Edit::None) {
-        cancelEdit();
+        commitEdit();  // never throw typed text away
     } else if (drawing_ || leader_.phase() != bs::MLeaderTool::Phase::ArrowTip) {
         drawing_ = false;
         leader_.cancel();
@@ -483,8 +519,13 @@ void CaptureWindow::onRButtonUp(bs::Vec2 p) {
 void CaptureWindow::onKeyDown(WPARAM key) {
     const bool ctrl = keyDown(VK_CONTROL);
     const bool shift = keyDown(VK_SHIFT);
+    if (menu_.open && key == VK_ESCAPE) {
+        menu_.open = false;
+        invalidate();
+        return;
+    }
     if (edit_ != Edit::None) {  // characters arrive through WM_CHAR
-        if (key == VK_ESCAPE) cancelEdit();
+        if (key == VK_ESCAPE) commitEdit();  // Esc finishes, keeping the text
         if (ctrl && key == 'B') applyStyle([](bs::Shape& s) { s.textStyle.bold = !s.textStyle.bold; });
         if (ctrl && key == 'I') applyStyle([](bs::Shape& s) { s.textStyle.italic = !s.textStyle.italic; });
         invalidate();
@@ -581,19 +622,23 @@ void CaptureWindow::onKeyDown(WPARAM key) {
 void CaptureWindow::onChar(wchar_t c) {
     if (edit_ == Edit::None) return;
     std::wstring& text = editShape_.text;
-    if (c == L'\b') {
-        if (!text.empty()) text.pop_back();
-        if (!text.empty() && IS_HIGH_SURROGATE(text.back())) text.pop_back();
-    } else if (c == L'\r') {
-        if (keyDown(VK_SHIFT)) {
+    switch (bs::classifyTextChar(c, keyDown(VK_CONTROL))) {
+        case bs::TextKey::Backspace:
+            if (!text.empty()) text.pop_back();
+            if (!text.empty() && IS_HIGH_SURROGATE(text.back())) text.pop_back();
+            break;
+        case bs::TextKey::Newline:
             text += L'\n';
-        } else {
+            break;
+        case bs::TextKey::Commit:
             commitEdit();
             invalidate();
             return;
-        }
-    } else if (c >= 32) {
-        text += c;
+        case bs::TextKey::Insert:
+            text += c;
+            break;
+        case bs::TextKey::Ignore:
+            return;
     }
     gfx::measureShapeText(editShape_);
     placeImeWindow();
@@ -644,9 +689,14 @@ void CaptureWindow::run(Action a, int arg, int dir) {
     switch (a) {
         case Action::Tool: selectTool(static_cast<Tool>(arg)); break;
         case Action::Color: {
-            colorIndex_ = std::clamp(arg, 0, kPaletteSize - 1);
-            const bs::Color c = kPalette[colorIndex_];
-            if (edit_ != Edit::None || picked_) applyStyle([c](bs::Shape& s) { s.color = c; });
+            colorIndex_ = std::clamp(arg, 0, kSwatchCount - 1);
+            const bool frosted = colorIndex_ == kFrostedSwatch;
+            const bs::Color c = frosted ? bs::Color{1, 1, 1, 1} : kPalette[colorIndex_];
+            if (edit_ != Edit::None || picked_)
+                applyStyle([c, frosted](bs::Shape& s) {
+                    s.color = c;
+                    s.material = frosted ? bs::Material::Frosted : bs::Material::Solid;
+                });
             break;
         }
         case Action::Width: {
@@ -660,22 +710,18 @@ void CaptureWindow::run(Action a, int arg, int dir) {
             break;
         }
         case Action::Finish:
-            applyStyle([dir](bs::Shape& s) {
-                s.finish = static_cast<bs::LineFinish>(wrap(static_cast<int>(s.finish) + dir, bs::kLineFinishCount));
-            });
-            break;
         case Action::Head:
-            applyStyle([dir](bs::Shape& s) {
-                s.head = static_cast<bs::EndShape>(wrap(static_cast<int>(s.head) + dir, bs::kEndShapeCount));
-            });
-            break;
         case Action::Tail:
-            applyStyle([dir](bs::Shape& s) {
-                s.tail = static_cast<bs::EndShape>(wrap(static_cast<int>(s.tail) + dir, bs::kEndShapeCount));
-            });
-            break;
         case Action::Font:
-            applyStyle([dir](bs::Shape& s) { s.textStyle.font = wrap(s.textStyle.font + dir, bs::kFontCount); });
+        case Action::List:
+        case Action::MosaicMode:
+            setStyleValue(a, wrap(styleValue(a) + dir, optionCount(a)));
+            break;
+        case Action::Newline:
+            if (edit_ != Edit::None) {
+                editShape_.text += L'\n';
+                gfx::measureShapeText(editShape_);
+            }
             break;
         case Action::Bold:
             applyStyle([](bs::Shape& s) { s.textStyle.bold = !s.textStyle.bold; });
@@ -683,18 +729,8 @@ void CaptureWindow::run(Action a, int arg, int dir) {
         case Action::Italic:
             applyStyle([](bs::Shape& s) { s.textStyle.italic = !s.textStyle.italic; });
             break;
-        case Action::List:
-            applyStyle([dir](bs::Shape& s) {
-                s.textStyle.list = static_cast<bs::ListStyle>(wrap(static_cast<int>(s.textStyle.list) + dir, 3));
-            });
-            break;
         case Action::Plate:
             applyStyle([](bs::Shape& s) { s.textStyle.background = !s.textStyle.background; });
-            break;
-        case Action::MosaicMode:
-            applyStyle([](bs::Shape& s) {
-                s.mosaic = s.mosaic == bs::MosaicMode::Pixelate ? bs::MosaicMode::Blur : bs::MosaicMode::Pixelate;
-            });
             break;
         case Action::Delete: deletePicked(); break;
         case Action::Undo:
@@ -712,6 +748,109 @@ void CaptureWindow::run(Action a, int arg, int dir) {
     }
     if (edit_ != Edit::None) placeImeWindow();
     invalidate();
+}
+
+bool CaptureWindow::isMenuAction(Action a) {
+    return a == Action::Finish || a == Action::Head || a == Action::Tail || a == Action::Font || a == Action::List ||
+           a == Action::MosaicMode;
+}
+
+int CaptureWindow::optionCount(Action a) {
+    switch (a) {
+        case Action::Finish: return bs::kLineFinishCount;
+        case Action::Head:
+        case Action::Tail: return bs::kEndShapeCount;
+        case Action::Font: return bs::kFontCount;
+        case Action::List: return bs::kListStyleCount;
+        case Action::MosaicMode: return 2;
+        default: return 1;
+    }
+}
+
+int CaptureWindow::styleValue(Action a) const {
+    const bs::Shape& s = styleSource();
+    switch (a) {
+        case Action::Finish: return static_cast<int>(s.finish);
+        case Action::Head: return static_cast<int>(s.head);
+        case Action::Tail: return static_cast<int>(s.tail);
+        case Action::Font: return s.textStyle.font;
+        case Action::List: return static_cast<int>(s.textStyle.list);
+        case Action::MosaicMode: return static_cast<int>(s.mosaic);
+        default: return 0;
+    }
+}
+
+void CaptureWindow::setStyleValue(Action a, int value) {
+    const int v = std::clamp(value, 0, optionCount(a) - 1);
+    applyStyle([a, v](bs::Shape& s) {
+        switch (a) {
+            case Action::Finish: s.finish = static_cast<bs::LineFinish>(v); break;
+            case Action::Head: s.head = static_cast<bs::EndShape>(v); break;
+            case Action::Tail: s.tail = static_cast<bs::EndShape>(v); break;
+            case Action::Font: s.textStyle.font = v; break;
+            case Action::List: s.textStyle.list = static_cast<bs::ListStyle>(v); break;
+            case Action::MosaicMode: s.mosaic = static_cast<bs::MosaicMode>(v); break;
+            default: break;
+        }
+    });
+}
+
+std::wstring CaptureWindow::optionLabel(Action a, int v) const {
+    switch (a) {
+        case Action::Finish: return bs::finishName(static_cast<bs::LineFinish>(v));
+        case Action::Head:
+        case Action::Tail: return bs::endShapeName(static_cast<bs::EndShape>(v));
+        case Action::Font: return std::wstring(bs::fontLabel(v)) + L"  " + bs::fontFamily(v);
+        case Action::List: return bs::listStyleName(static_cast<bs::ListStyle>(v));
+        case Action::MosaicMode: return bs::mosaicModeName(static_cast<bs::MosaicMode>(v));
+        default: return {};
+    }
+}
+
+std::wstring CaptureWindow::tooltipFor(const Button& b) const {
+    static const wchar_t* const tools[kToolCount] = {
+        L"", L"矩形  1", L"椭圆  2", L"直线  3", L"箭头  4", L"画笔  5",
+        L"文本  6 · Enter 换行 · Ctrl+Enter / Esc / 点击别处 完成", L"多重引线  7 · 依次点：箭头尖 → 折点 → 横肩 · Shift 取消 45° 吸附",
+        L"马赛克 / 毛玻璃  8"};
+    static const wchar_t* const widths[kWidthCount] = {L"细", L"中", L"粗"};
+    const std::wstring more = L"  ·  点击展开，右键切换";
+    switch (b.action) {
+        case Action::Tool: return tools[std::clamp(b.arg, 0, kToolCount - 1)];
+        case Action::Color: return kSwatchNames[std::clamp(b.arg, 0, kSwatchCount - 1)];
+        case Action::Width: return std::wstring(L"线宽 / 字号：") + widths[std::clamp(b.arg, 0, kWidthCount - 1)];
+        case Action::Undo: return L"撤回  Ctrl+Z";
+        case Action::Redo: return L"重做  Ctrl+Y";
+        case Action::Cancel: return L"退出  Esc";
+        case Action::Pin: return L"贴到桌面  F3 · 双击贴图即关闭";
+        case Action::Save: return L"保存 PNG  Ctrl+S";
+        case Action::Copy: return L"复制并完成  Enter / Ctrl+C / 双击选区";
+        case Action::Finish: return L"线型：" + optionLabel(b.action, styleValue(b.action)) + more;
+        case Action::Head: return L"头部（箭头端）：" + optionLabel(b.action, styleValue(b.action)) + more;
+        case Action::Tail: return L"尾部：" + optionLabel(b.action, styleValue(b.action)) + more;
+        case Action::Font: return L"字体：" + optionLabel(b.action, styleValue(b.action)) + more;
+        case Action::List: return L"列表：" + optionLabel(b.action, styleValue(b.action)) + more + L"（行首输入 * 也会变圆点）";
+        case Action::MosaicMode: return L"马赛克样式：" + optionLabel(b.action, styleValue(b.action)) + more;
+        case Action::Bold: return L"粗体  Ctrl+B";
+        case Action::Italic: return L"斜体  Ctrl+I";
+        case Action::Plate: return L"文字底衬";
+        case Action::Delete: return L"删除选中标注  Delete";
+        case Action::Newline: return L"换行  Enter";
+    }
+    return {};
+}
+
+void CaptureWindow::openMenu(const Button& b) {
+    const float row = 30.0f * ui_, pad = 6.0f * ui_, width = 230.0f * ui_;
+    const float height = static_cast<float>(optionCount(b.action)) * row + 2.0f * pad;
+    menu_ = {true, b.action, bs::placePopup(b.rect, width, height, monitorFor(sel_), 6.0f * ui_), -1};
+    tipButton_ = -1;
+}
+
+int CaptureWindow::menuRowAt(bs::Vec2 p) const {
+    if (!menu_.open || !bs::contains(menu_.rect, p)) return -1;
+    const float row = 30.0f * ui_, pad = 6.0f * ui_;
+    const int i = static_cast<int>(std::floor((p.y - menu_.rect.top - pad) / row));
+    return i >= 0 && i < optionCount(menu_.action) ? i : -1;
 }
 
 void CaptureWindow::deletePicked() {
@@ -755,6 +894,8 @@ void CaptureWindow::resetToPicking() {
     tool_ = Tool::None;
     dragHandle_ = bs::Handle::None;
     buttons_.clear();
+    menu_.open = false;
+    tipButton_ = -1;
     hover_ = bs::pickWindowRect(grab_.windows, cursor_);
     invalidate();
 }
@@ -905,7 +1046,7 @@ void CaptureWindow::layoutToolbar() {
 
     std::vector<Item> main;
     for (int t = 1; t < kToolCount; ++t) main.push_back({Action::Tool, t, false});
-    for (int c = 0; c < kPaletteSize; ++c) main.push_back({Action::Color, c, c == 0});
+    for (int c = 0; c < kSwatchCount; ++c) main.push_back({Action::Color, c, c == 0});
     for (int w = 0; w < kWidthCount; ++w) main.push_back({Action::Width, w, false});
     main.push_back({Action::Undo, 0, true});
     main.push_back({Action::Redo, 0, false});
@@ -937,6 +1078,7 @@ void CaptureWindow::layoutToolbar() {
             sub.push_back({Action::Italic, 0, false});
             sub.push_back({Action::List, 0, false});
             sub.push_back({Action::Plate, 0, false});
+            if (edit_ != Edit::None) sub.push_back({Action::Newline, 0, false});
         }
         if (*kind == bs::ShapeKind::Mosaic) sub.push_back({Action::MosaicMode, 0, false});
     }
@@ -989,7 +1131,11 @@ void CaptureWindow::paint() {
         paintSelectionChrome(active);
     }
     rt_->SetTransform(D2D1::Matrix3x2F::Identity());
-    if (mode_ == Mode::Selected && dragHandle_ == bs::Handle::None && !drawing_ && !pick_.active) paintToolbar();
+    if (mode_ == Mode::Selected && dragHandle_ == bs::Handle::None && !drawing_ && !pick_.active) {
+        paintToolbar();
+        paintMenu();
+        paintTooltip();
+    }
     if (mode_ != Mode::Selected) paintMagnifier();
     if (animating_) paintAnimation(elapsed);
 
@@ -1235,8 +1381,6 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
     auto line = [&](float x0, float y0, float x1, float y1) {
         rt_->DrawLine(D2D1::Point2F(c.x + x0 * u, c.y + y0 * u), D2D1::Point2F(c.x + x1 * u, c.y + y1 * u), brush_.Get(), sw);
     };
-    const bs::Shape& style = styleSource();
-
     switch (b.action) {
         case Action::Tool:
             switch (static_cast<Tool>(b.arg)) {
@@ -1293,6 +1437,22 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
             }
             break;
         case Action::Color: {
+            if (b.arg == kFrostedSwatch) {  // glass bead: translucent layers + highlight
+                for (int i = 3; i >= 1; --i) {
+                    brush_->SetColor(D2D1::ColorF(0.85f, 0.90f, 1.0f, 0.22f));
+                    rt_->FillEllipse(D2D1::Ellipse(c, (4.0f + static_cast<float>(i)) * u, (4.0f + static_cast<float>(i)) * u),
+                                     brush_.Get());
+                }
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.85f));
+                rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x - 2.5f * u, c.y - 2.5f * u), 1.8f * u, 1.8f * u),
+                                 brush_.Get());
+                rt_->DrawEllipse(D2D1::Ellipse(c, 7 * u, 7 * u), brush_.Get(), 1.0f);
+                if (b.arg == colorIndex_) {
+                    brush_->SetColor(kOnSurface);
+                    rt_->DrawEllipse(D2D1::Ellipse(c, 10.5f * u, 10.5f * u), brush_.Get(), 1.5f * u);
+                }
+                break;
+            }
             brush_->SetColor(gfx::toD2D(kPalette[b.arg]));
             rt_->FillEllipse(D2D1::Ellipse(c, 7 * u, 7 * u), brush_.Get());
             brush_->SetColor(kMuted);
@@ -1312,44 +1472,26 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
             }
             break;
         }
-        case Action::Finish: {
-            ComPtr<ID2D1StrokeStyle> st;
-            const D2D1_DASH_STYLE dash[] = {D2D1_DASH_STYLE_SOLID, D2D1_DASH_STYLE_DASH, D2D1_DASH_STYLE_DOT,
-                                            D2D1_DASH_STYLE_DASH_DOT};
-            gfx::factories().d2d->CreateStrokeStyle(
-                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
-                                            D2D1_LINE_JOIN_ROUND, 10.0f, dash[static_cast<int>(style.finish)]),
-                nullptr, 0, st.GetAddressOf());
-            rt_->DrawLine(D2D1::Point2F(c.x - 11 * u, c.y), D2D1::Point2F(c.x + 11 * u, c.y), brush_.Get(), 2.0f * u, st.Get());
+        case Action::Finish:
+        case Action::Head:
+        case Action::Tail:
+        case Action::Font:
+        case Action::List:
+        case Action::MosaicMode:
+            paintOptionIcon(b.action, styleValue(b.action), c, fg);
+            // Tiny tick marks the buttons that open a dropdown.
+            rt_->FillRectangle(D2D1::RectF(b.rect.right - 8 * u, b.rect.bottom - 6 * u, b.rect.right - 4 * u,
+                                           b.rect.bottom - 5 * u),
+                               brush_.Get());
             break;
-        }
-        case Action::Head: paintCapSample(c, style.head, true); break;
-        case Action::Tail: paintCapSample(c, style.tail, false); break;
-        case Action::Font: {
-            const auto& f = fontFormats_[static_cast<std::size_t>(std::clamp(style.textStyle.font, 0, bs::kFontCount - 1))];
-            const std::wstring label = bs::fontLabel(style.textStyle.font);
-            rt_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), f.Get(),
-                          D2D1::RectF(b.rect.left - 6 * u, b.rect.top, b.rect.right + 6 * u, b.rect.bottom), brush_.Get());
+        case Action::Newline:  // ↵
+            line(6, -6, 6, 2);
+            line(6, 2, -6, 2);
+            line(-6, 2, -2, -2);
+            line(-6, 2, -2, 6);
             break;
-        }
         case Action::Bold: glyph(L"B", glyphFont_.Get()); break;
         case Action::Italic: glyph(L"I", italicFont_.Get()); break;
-        case Action::List: {
-            for (int i = 0; i < 3; ++i) {
-                const float y = c.y + (static_cast<float>(i) - 1.0f) * 5.5f * u;
-                line(-2, (y - c.y) / u, 9, (y - c.y) / u);
-            }
-            if (style.textStyle.list == bs::ListStyle::Numbered) {
-                rt_->DrawText(L"1\n2\n3", 5, labelFont_.Get(), D2D1::RectF(c.x - 10 * u, c.y - 9 * u, c.x - 2 * u, c.y + 10 * u),
-                              brush_.Get());
-            } else {
-                for (int i = 0; i < 3; ++i)
-                    rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x - 6 * u, c.y + (static_cast<float>(i) - 1.0f) * 5.5f * u),
-                                                   1.6f * u, 1.6f * u),
-                                     brush_.Get());
-            }
-            break;
-        }
         case Action::Plate:
             brush_->SetColor(D2D1::ColorF(fg.r, fg.g, fg.b, 0.35f));
             rt_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x - 10 * u, c.y - 8 * u, c.x + 10 * u, c.y + 8 * u),
@@ -1358,8 +1500,54 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
             brush_->SetColor(fg);
             glyph(L"A", glyphFont_.Get());
             break;
+        case Action::Delete: glyph(L"\uE74D", iconFont_.Get()); break;
+        case Action::Undo: glyph(L"\uE7A7", iconFont_.Get()); break;
+        case Action::Redo: glyph(L"\uE7A6", iconFont_.Get()); break;
+        case Action::Pin: glyph(L"\uE718", iconFont_.Get()); break;
+        case Action::Save: glyph(L"\uE74E", iconFont_.Get()); break;
+        case Action::Copy: glyph(L"\uE8C8", iconFont_.Get()); break;
+        case Action::Cancel: glyph(L"\uE711", iconFont_.Get()); break;
+    }
+}
+
+void CaptureWindow::paintOptionIcon(Action a, int v, D2D1_POINT_2F c, D2D1_COLOR_F fg) {
+    const float u = ui_;
+    brush_->SetColor(fg);
+    switch (a) {
+        case Action::Finish: {
+            ComPtr<ID2D1StrokeStyle> st;
+            const D2D1_DASH_STYLE dash[] = {D2D1_DASH_STYLE_SOLID, D2D1_DASH_STYLE_DASH, D2D1_DASH_STYLE_DOT,
+                                            D2D1_DASH_STYLE_DASH_DOT};
+            gfx::factories().d2d->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
+                                            D2D1_LINE_JOIN_ROUND, 10.0f, dash[std::clamp(v, 0, 3)]),
+                nullptr, 0, st.GetAddressOf());
+            rt_->DrawLine(D2D1::Point2F(c.x - 11 * u, c.y), D2D1::Point2F(c.x + 11 * u, c.y), brush_.Get(), 2.0f * u, st.Get());
+            break;
+        }
+        case Action::Head: paintCapSample(c, static_cast<bs::EndShape>(v), true); break;
+        case Action::Tail: paintCapSample(c, static_cast<bs::EndShape>(v), false); break;
+        case Action::Font: {
+            const auto& f = fontFormats_[static_cast<std::size_t>(std::clamp(v, 0, bs::kFontCount - 1))];
+            const std::wstring label = bs::fontLabel(v);
+            rt_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), f.Get(),
+                          D2D1::RectF(c.x - 23 * u, c.y - 17 * u, c.x + 23 * u, c.y + 17 * u), brush_.Get());
+            break;
+        }
+        case Action::List: {
+            for (int i = 0; i < 3; ++i) {
+                const float y = c.y + (static_cast<float>(i) - 1.0f) * 5.5f * u;
+                rt_->DrawLine(D2D1::Point2F(c.x - 2 * u, y), D2D1::Point2F(c.x + 9 * u, y), brush_.Get(), 1.6f * u);
+                if (v == static_cast<int>(bs::ListStyle::Bullet))
+                    rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x - 6 * u, y), 1.6f * u, 1.6f * u), brush_.Get());
+            }
+            if (v == static_cast<int>(bs::ListStyle::Numbered))
+                rt_->DrawText(L"1\n2\n3", 5, labelFont_.Get(), D2D1::RectF(c.x - 10 * u, c.y - 9 * u, c.x - 2 * u, c.y + 10 * u),
+                              brush_.Get());
+            break;
+        }
         case Action::MosaicMode:
-            if (style.mosaic == bs::MosaicMode::Pixelate) {
+            if (v == static_cast<int>(bs::MosaicMode::Pixelate)) {
                 for (int i = 0; i < 4; ++i)
                     for (int j = 0; j < 4; ++j) {
                         brush_->SetColor(D2D1::ColorF(fg.r, fg.g, fg.b, (i + j) % 2 ? 0.9f : 0.3f));
@@ -1377,14 +1565,65 @@ void CaptureWindow::paintButtonIcon(const Button& b, D2D1_COLOR_F fg) {
                 }
             }
             break;
-        case Action::Delete: glyph(L"", iconFont_.Get()); break;
-        case Action::Undo: glyph(L"", iconFont_.Get()); break;
-        case Action::Redo: glyph(L"", iconFont_.Get()); break;
-        case Action::Pin: glyph(L"", iconFont_.Get()); break;
-        case Action::Save: glyph(L"", iconFont_.Get()); break;
-        case Action::Copy: glyph(L"", iconFont_.Get()); break;
-        case Action::Cancel: glyph(L"", iconFont_.Get()); break;
+        default:
+            break;
     }
+}
+
+void CaptureWindow::paintMenu() {
+    if (!menu_.open) return;
+    const float radius = 10.0f * ui_, row = 30.0f * ui_, pad = 6.0f * ui_;
+    const bs::Rect& r = menu_.rect;
+    for (int i = 3; i >= 1; --i) {
+        const float g = static_cast<float>(i) * 2.0f * ui_;
+        brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.12f));
+        rt_->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(r.left - g, r.top - g + 2 * ui_, r.right + g, r.bottom + g + 2 * ui_), radius + g,
+                              radius + g),
+            brush_.Get());
+    }
+    brush_->SetColor(kSurface);
+    rt_->FillRoundedRectangle(D2D1::RoundedRect(gfx::toD2D(r), radius, radius), brush_.Get());
+    const int current = styleValue(menu_.action);
+    for (int i = 0; i < optionCount(menu_.action); ++i) {
+        const float top = r.top + pad + static_cast<float>(i) * row;
+        const auto bg = D2D1::RoundedRect(D2D1::RectF(r.left + 4 * ui_, top + 1, r.right - 4 * ui_, top + row - 1), 6 * ui_, 6 * ui_);
+        if (i == current) {
+            brush_->SetColor(kAccentSoft);
+            rt_->FillRoundedRectangle(bg, brush_.Get());
+        }
+        if (i == menu_.hover) {
+            brush_->SetColor(kHover);
+            rt_->FillRoundedRectangle(bg, brush_.Get());
+        }
+        paintOptionIcon(menu_.action, i, D2D1::Point2F(r.left + 28 * ui_, top + row / 2), kOnSurface);
+        const std::wstring label = optionLabel(menu_.action, i);
+        brush_->SetColor(kOnSurface);
+        labelFont_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        rt_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), labelFont_.Get(),
+                      D2D1::RectF(r.left + 58 * ui_, top, r.right - 8 * ui_, top + row), brush_.Get());
+        labelFont_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }
+}
+
+void CaptureWindow::paintTooltip() {
+    if (menu_.open || tipButton_ < 0 || static_cast<std::size_t>(tipButton_) >= buttons_.size()) return;
+    const Button& b = buttons_[static_cast<std::size_t>(tipButton_)];
+    const std::wstring text = tooltipFor(b);
+    if (text.empty()) return;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(gfx::factories().dwrite->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), labelFont_.Get(),
+                                                         520.0f * ui_, 200.0f * ui_, layout.GetAddressOf())))
+        return;
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    const float padX = 10.0f * ui_, padY = 5.0f * ui_;
+    const bs::Rect r = bs::placePopup(b.rect, m.widthIncludingTrailingWhitespace + 2 * padX, m.height + 2 * padY,
+                                      monitorFor(sel_), 6.0f * ui_);
+    brush_->SetColor(D2D1::ColorF(0.18f, 0.18f, 0.21f, 0.97f));
+    rt_->FillRoundedRectangle(D2D1::RoundedRect(gfx::toD2D(r), 6 * ui_, 6 * ui_), brush_.Get());
+    brush_->SetColor(kOnSurface);
+    rt_->DrawTextLayout(D2D1::Point2F(r.left + padX, r.top + padY), layout.Get(), brush_.Get());
 }
 
 void CaptureWindow::paintMagnifier() {
@@ -1482,9 +1721,14 @@ const wchar_t* CaptureWindow::smoke(const bs::Rect& r) {
     run(Action::Italic, 0, +1);
     run(Action::List, 0, -1);  // None → Numbered
     run(Action::Plate, 0, +1);
-    for (wchar_t ch : std::wstring(L"第一\r")) onChar(ch == L'\r' ? L'x' : ch);
-    editShape_.text += L"\n* 要点";
-    commitEdit();
+    for (wchar_t ch : std::wstring(L"第一\r* 要点")) onChar(ch);  // plain Enter breaks the line
+    if (editShape_.text != L"第一\n* 要点") return L"Enter did not insert a line break";
+    run(Action::Newline, 0, +1);
+    onChar(L'\b');
+    if (editShape_.text != L"第一\n* 要点") return L"newline button / backspace mismatch";
+    const std::size_t before = doc_.shapes().size();
+    onChar(L'\n');  // Ctrl+Enter arrives as LF and finishes
+    if (edit_ != Edit::None || doc_.shapes().size() != before + 1) return L"Ctrl+Enter did not finish the text";
     const bs::Shape& text = doc_.shapes().back();
     if (text.textStyle.list != bs::ListStyle::Numbered || !text.textStyle.italic || text.textSize.x <= 0)
         return L"text style not applied";
@@ -1509,8 +1753,26 @@ const wchar_t* CaptureWindow::smoke(const bs::Rect& r) {
     paint();  // angle readout while dragging
     onLButtonUp(kink + bs::Vec2{10, -10}, false);
     if (!(doc_.shapes()[li].leader.kink == kink + bs::Vec2{10, -10})) return L"kink drag not applied";
-    run(Action::Head, 0, +1);  // restyle the picked shape
+    run(Action::Head, 0, +1);  // restyle the picked shape (right-click style cycle)
     paint();
+
+    // Dropdown: open the Head menu of the picked leader and choose "Dot".
+    const auto headBtn = std::find_if(buttons_.begin(), buttons_.end(), [](const Button& b) { return b.action == Action::Head; });
+    if (headBtn == buttons_.end()) return L"no Head button for the picked leader";
+    openMenu(*headBtn);
+    paint();
+    const float row = 30.0f * ui_, pad = 6.0f * ui_;
+    const bs::Vec2 dotRow{menu_.rect.left + 20.0f, menu_.rect.top + pad + row * 3.5f};
+    onMouseMove(dotRow, false);
+    onLButtonDown(dotRow);
+    onLButtonUp(dotRow, false);
+    if (menu_.open || doc_.shapes()[li].head != bs::EndShape::Dot) return L"dropdown pick not applied";
+    // Frosted material turns the dot head into a glass lens.
+    run(Action::Color, kFrostedSwatch, +1);
+    if (doc_.shapes()[li].material != bs::Material::Frosted) return L"frosted material not applied";
+    tipButton_ = 0;  // tooltip frame
+    paint();
+    tipButton_ = -1;
 
     // Double-click edits the label in place; Delete removes; undo restores.
     const std::size_t count = doc_.shapes().size();

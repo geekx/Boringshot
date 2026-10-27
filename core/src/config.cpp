@@ -225,6 +225,22 @@ std::wstring serializeConfig(const Config& c) {
            (w.enableOnAllMonitors ? L"true" : L"false") + L"\n";
 }
 
+std::vector<std::wstring> validateConfig(const Config& c) {
+    std::vector<std::wstring> problems;
+    const struct {
+        const wchar_t* name;
+        Hotkey key;
+    } keys[] = {{L"截图", c.capture}, {L"截图（备用）", c.captureAlt}, {L"水印开关", c.watermark}};
+    for (std::size_t i = 0; i < 3; ++i)
+        for (std::size_t j = i + 1; j < 3; ++j)
+            if (keys[i].key.enabled() && keys[i].key == keys[j].key)
+                problems.push_back(std::wstring(keys[i].name) + L" 与 " + keys[j].name + L" 使用了同一个热键 " +
+                                   formatHotkey(keys[i].key));
+    if (c.capture.enabled() == false && c.captureAlt.enabled() == false)
+        problems.push_back(L"截图热键都被禁用了，只能从托盘图标截图");
+    return problems;
+}
+
 Hotkey hotkeyFromControl(unsigned value) {
     Hotkey h;
     h.vk = value & 0xFFu;

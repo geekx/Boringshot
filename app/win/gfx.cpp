@@ -10,6 +10,7 @@
 
 #include "boringshot/image_ops.h"
 #include "boringshot/selection.h"
+#include "boringshot/shape_edit.h"
 
 namespace gfx {
 namespace {
@@ -18,38 +19,112 @@ std::size_t index(int x, int y, int width) {
     return static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
 }
 
-ComPtr<ID2D1Factory> factoryOf(ID2D1RenderTarget* rt) {
-    ComPtr<ID2D1Factory> f;
-    rt->GetFactory(f.GetAddressOf());
-    return f;
-}
-
-void fillPolygon(ID2D1RenderTarget* rt, const std::vector<bs::Vec2>& pts, ID2D1Brush* brush, bool fill, float w,
-                 ID2D1StrokeStyle* stroke, bool closed) {
-    if (pts.size() < 2) return;
+ComPtr<ID2D1Geometry> polyGeometry(ID2D1Factory* f, const std::vector<bs::Vec2>& pts, bool closed, bool filled) {
     ComPtr<ID2D1PathGeometry> path;
     ComPtr<ID2D1GeometrySink> sink;
-    if (FAILED(factoryOf(rt)->CreatePathGeometry(path.GetAddressOf())) || FAILED(path->Open(sink.GetAddressOf())))
-        return;
-    sink->BeginFigure(toD2D(pts[0]), fill ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
+    if (pts.size() < 2 || FAILED(f->CreatePathGeometry(path.GetAddressOf())) || FAILED(path->Open(sink.GetAddressOf())))
+        return {};
+    sink->BeginFigure(toD2D(pts[0]), filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
     for (std::size_t i = 1; i < pts.size(); ++i) sink->AddLine(toD2D(pts[i]));
     sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
-    if (FAILED(sink->Close())) return;
-    if (fill) rt->FillGeometry(path.Get(), brush);
-    else rt->DrawGeometry(path.Get(), brush, w, stroke);
+    if (FAILED(sink->Close())) return {};
+    return path;
 }
 
-void drawEndCap(ID2D1RenderTarget* rt, const bs::EndCap& cap, ID2D1Brush* brush, float w, ID2D1StrokeStyle* round) {
-    switch (cap.shape) {
-        case bs::EndShape::None:
-            break;
-        case bs::EndShape::Dot:
-            rt->FillEllipse(D2D1::Ellipse(toD2D(cap.center), cap.radius, cap.radius), brush);
-            break;
-        default:
-            fillPolygon(rt, cap.outline, brush, cap.filled, w, round, cap.closed);
-            break;
+// Draws primitives in solid ink, or as frosted glass: a blurred copy of the
+// frozen frame as the brush, a feathered 1–2 px rim, a light tint and (for
+// filled forms) a highlight edge.
+class Painter {
+public:
+    Painter(ID2D1RenderTarget* rt, const bs::Shape& s, const Image* source) : rt_(rt), w_(s.strokeWidth) {
+        rt->GetFactory(f_.GetAddressOf());
+        rt->CreateSolidColorBrush(toD2D(s.color), solid_.GetAddressOf());
+        if (s.material == bs::Material::Frosted && source && !source->empty()) makeFrost(s, *source);
     }
+    bool ok() const { return solid_ && f_; }
+    bool frosted() const { return frost_ != nullptr; }
+    ID2D1Factory* factory() const { return f_.Get(); }
+    ID2D1SolidColorBrush* solid() const { return solid_.Get(); }
+
+    void line(bs::Vec2 a, bs::Vec2 b, ID2D1StrokeStyle* st) {
+        layers(
+            [&](ID2D1Brush* br, float grow) {
+                if (grow >= 0) rt_->DrawLine(toD2D(a), toD2D(b), br, w_ + 2.0f * grow, st);
+            },
+            false);
+    }
+
+    void geometry(ID2D1Geometry* g, bool fill, ID2D1StrokeStyle* st) {
+        if (!g) return;
+        layers(
+            [&](ID2D1Brush* br, float grow) {
+                if (grow < 0) {
+                    rt_->DrawGeometry(g, br, 1.0f);  // highlight rim
+                } else if (fill) {
+                    rt_->FillGeometry(g, br);
+                    if (grow > 0) rt_->DrawGeometry(g, br, 2.0f * grow);
+                } else {
+                    rt_->DrawGeometry(g, br, w_ + 2.0f * grow, st);
+                }
+            },
+            fill);
+    }
+
+private:
+    template <class F>
+    void layers(F draw, bool fill) {
+        if (!frost_) {
+            draw(solid_.Get(), 0.0f);
+            return;
+        }
+        frost_->SetOpacity(0.45f);
+        draw(frost_.Get(), 1.5f);  // feathered edge
+        frost_->SetOpacity(1.0f);
+        draw(frost_.Get(), 0.0f);
+        draw(tint_.Get(), 0.0f);
+        if (fill) draw(rim_.Get(), -1.0f);
+    }
+
+    void makeFrost(const bs::Shape& s, const Image& src) {
+        const float pad = 2.6f * w_ + 16.0f;  // room for lens heads and the feather
+        const bs::Rect b = bs::shapeBounds(s);
+        const int x = static_cast<int>(std::floor(b.left - pad)), y = static_cast<int>(std::floor(b.top - pad));
+        const int w = static_cast<int>(std::ceil(b.right + pad)) - x, h = static_cast<int>(std::ceil(b.bottom + pad)) - y;
+        const bs::PixelBlock blk =
+            bs::boxBlur({src.px.data(), src.width, src.height}, x, y, w, h, static_cast<int>(5.0f + w_));
+        if (blk.empty()) return;
+        const Image img{blk.width, blk.height, blk.px};
+        auto bmp = makeBitmap(rt_, img);
+        ComPtr<ID2D1BitmapBrush> brush;
+        if (!bmp || FAILED(rt_->CreateBitmapBrush(bmp.Get(),
+                                                  D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                                              D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),
+                                                  brush.GetAddressOf())))
+            return;
+        // Brush space == shape space, whatever world transform the target carries.
+        brush->SetTransform(D2D1::Matrix3x2F::Translation(static_cast<float>(blk.x), static_cast<float>(blk.y)));
+        rt_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.16f), tint_.GetAddressOf());
+        rt_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.6f), rim_.GetAddressOf());
+        if (tint_ && rim_) frost_ = brush;
+    }
+
+    ID2D1RenderTarget* rt_;
+    float w_;
+    ComPtr<ID2D1Factory> f_;
+    ComPtr<ID2D1SolidColorBrush> solid_, tint_, rim_;
+    ComPtr<ID2D1BitmapBrush> frost_;
+};
+
+void drawEndCap(Painter& p, const bs::EndCap& cap, ID2D1StrokeStyle* round) {
+    if (cap.shape == bs::EndShape::None) return;
+    if (cap.shape == bs::EndShape::Dot) {
+        ComPtr<ID2D1EllipseGeometry> e;
+        p.factory()->CreateEllipseGeometry(D2D1::Ellipse(toD2D(cap.center), cap.radius, cap.radius), e.GetAddressOf());
+        p.geometry(e.Get(), true, nullptr);
+        return;
+    }
+    const auto g = polyGeometry(p.factory(), cap.outline, cap.closed, cap.filled);
+    p.geometry(g.Get(), cap.filled, round);
 }
 
 D2D1_DASH_STYLE dashOf(bs::LineFinish f) {
@@ -68,22 +143,34 @@ D2D1_COLOR_F plateFor(const bs::Color& c) {
     return luma > 0.55f ? D2D1::ColorF(0.05f, 0.05f, 0.07f, 0.62f) : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.82f);
 }
 
-void drawLabel(ID2D1RenderTarget* rt, const bs::Shape& s, bs::Vec2 origin, ID2D1SolidColorBrush* brush) {
+void drawLabel(ID2D1RenderTarget* rt, const bs::Shape& s, bs::Vec2 origin, Painter& p) {
     const std::wstring text = bs::displayText(s);
     if (text.empty()) return;
     auto layout = textLayout(text, s.fontSize, s.textStyle);
     if (!layout) return;
-    if (s.textStyle.background) {
+    ID2D1SolidColorBrush* brush = p.solid();
+    if (s.textStyle.background || p.frosted()) {  // frosted text always sits on a glass plate
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
         const float pad = s.fontSize * 0.25f;
-        brush->SetColor(plateFor(s.color));
-        rt->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(origin.x - pad, origin.y - pad * 0.5f,
-                                          origin.x + m.widthIncludingTrailingWhitespace + pad, origin.y + m.height + pad * 0.5f),
-                              pad, pad),
-            brush);
-        brush->SetColor(toD2D(s.color));
+        const auto plate = D2D1::RoundedRect(D2D1::RectF(origin.x - pad, origin.y - pad * 0.5f,
+                                                         origin.x + m.widthIncludingTrailingWhitespace + pad,
+                                                         origin.y + m.height + pad * 0.5f),
+                                             pad, pad);
+        if (p.frosted()) {
+            ComPtr<ID2D1RoundedRectangleGeometry> g;
+            p.factory()->CreateRoundedRectangleGeometry(plate, g.GetAddressOf());
+            p.geometry(g.Get(), true, nullptr);
+        } else {
+            brush->SetColor(plateFor(s.color));
+            rt->FillRoundedRectangle(plate, brush);
+            brush->SetColor(toD2D(s.color));
+        }
+    }
+    if (p.frosted()) {  // soft drop shadow keeps white ink legible on bright glass
+        brush->SetColor(D2D1::ColorF(0, 0, 0, 0.35f));
+        rt->DrawTextLayout(D2D1::Point2F(origin.x + 1.0f, origin.y + 1.0f), layout.Get(), brush);
+        brush->SetColor(D2D1::ColorF(D2D1::ColorF::White));
     }
     rt->DrawTextLayout(toD2D(origin), layout.Get(), brush);
 }
@@ -204,9 +291,9 @@ void drawShape(ID2D1RenderTarget* rt, const bs::Shape& s, const Image* source) {
         drawMosaic(rt, s, source);
         return;
     }
-    ComPtr<ID2D1SolidColorBrush> brush;
-    if (FAILED(rt->CreateSolidColorBrush(toD2D(s.color), brush.GetAddressOf()))) return;
-    const auto f = factoryOf(rt);
+    Painter p(rt, s, source);
+    if (!p.ok()) return;
+    ID2D1Factory* f = p.factory();
     const float w = s.strokeWidth;
     const bool dotted = s.finish == bs::LineFinish::Dotted;
     ComPtr<ID2D1StrokeStyle> stroke, round;
@@ -219,43 +306,46 @@ void drawShape(ID2D1RenderTarget* rt, const bs::Shape& s, const Image* source) {
                          nullptr, 0, round.GetAddressOf());
 
     switch (s.kind) {
-        case bs::ShapeKind::Rect:
-            rt->DrawRectangle(toD2D(bs::normalizedRect(s.a, s.b)), brush.Get(), w, stroke.Get());
+        case bs::ShapeKind::Rect: {
+            ComPtr<ID2D1RectangleGeometry> g;
+            f->CreateRectangleGeometry(toD2D(bs::normalizedRect(s.a, s.b)), g.GetAddressOf());
+            p.geometry(g.Get(), false, stroke.Get());
             break;
+        }
         case bs::ShapeKind::Ellipse: {
             const bs::Rect r = bs::normalizedRect(s.a, s.b);
-            rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F((r.left + r.right) * 0.5f, (r.top + r.bottom) * 0.5f),
-                                          r.width() * 0.5f, r.height() * 0.5f),
-                            brush.Get(), w, stroke.Get());
+            ComPtr<ID2D1EllipseGeometry> g;
+            f->CreateEllipseGeometry(D2D1::Ellipse(D2D1::Point2F((r.left + r.right) * 0.5f, (r.top + r.bottom) * 0.5f),
+                                                   r.width() * 0.5f, r.height() * 0.5f),
+                                     g.GetAddressOf());
+            p.geometry(g.Get(), false, stroke.Get());
             break;
         }
         case bs::ShapeKind::Line:
         case bs::ShapeKind::Arrow: {
-            const auto head = bs::makeEndCap(s.head, s.a, s.b, w);
-            const auto tail = bs::makeEndCap(s.tail, s.b, s.a, w);
-            rt->DrawLine(toD2D(tail.shaftEnd), toD2D(head.shaftEnd), brush.Get(), w, stroke.Get());
-            drawEndCap(rt, head, brush.Get(), w, round.Get());
-            drawEndCap(rt, tail, brush.Get(), w, round.Get());
+            const auto head = bs::makeEndCap(s.head, s.a, s.b, w, s.material);
+            const auto tail = bs::makeEndCap(s.tail, s.b, s.a, w, s.material);
+            p.line(tail.shaftEnd, head.shaftEnd, stroke.Get());
+            drawEndCap(p, head, round.Get());
+            drawEndCap(p, tail, round.Get());
             break;
         }
-        case bs::ShapeKind::Pen: {
-            if (s.points.size() < 2) break;
-            fillPolygon(rt, s.points, brush.Get(), false, w, stroke.Get(), false);
+        case bs::ShapeKind::Pen:
+            if (s.points.size() >= 2) p.geometry(polyGeometry(f, s.points, false, false).Get(), false, stroke.Get());
             break;
-        }
         case bs::ShapeKind::Text:
-            drawLabel(rt, s, s.a, brush.Get());
+            drawLabel(rt, s, s.a, p);
             break;
         case bs::ShapeKind::MLeader: {
             const auto l = bs::leaderLayout(s);
-            const auto head = bs::makeEndCap(s.head, l.kink, l.arrowTip, w);
-            const auto tail = bs::makeEndCap(s.tail, l.landingStart, l.landingEnd, w);
+            const auto head = bs::makeEndCap(s.head, l.kink, l.arrowTip, w, s.material);
+            const auto tail = bs::makeEndCap(s.tail, l.landingStart, l.landingEnd, w, s.material);
             if (head.shape != bs::EndShape::None || bs::length(l.arrowTip - l.kink) > 0.5f)
-                rt->DrawLine(toD2D(head.shaftEnd), toD2D(l.kink), brush.Get(), w, stroke.Get());
-            rt->DrawLine(toD2D(l.landingStart), toD2D(tail.shaftEnd), brush.Get(), w, stroke.Get());
-            drawEndCap(rt, head, brush.Get(), w, round.Get());
-            drawEndCap(rt, tail, brush.Get(), w, round.Get());
-            drawLabel(rt, s, {l.textRect.left, l.textRect.top}, brush.Get());
+                p.line(head.shaftEnd, l.kink, stroke.Get());
+            p.line(l.landingStart, tail.shaftEnd, stroke.Get());
+            drawEndCap(p, head, round.Get());
+            drawEndCap(p, tail, round.Get());
+            drawLabel(rt, s, {l.textRect.left, l.textRect.top}, p);
             break;
         }
         case bs::ShapeKind::Mosaic:
