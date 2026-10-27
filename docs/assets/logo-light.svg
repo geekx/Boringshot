@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" role="img" aria-label="Boringshot">
+  <rect width="64" height="64" rx="14" fill="#F4F1EA"/>
+  <g fill="none" stroke="#15181D" stroke-width="4" stroke-linecap="square">
+    <path d="M13 23V13H23"/><path d="M41 13H51V23"/><path d="M51 41V51H41"/><path d="M23 51H13V41"/>
+  </g>
+  <path d="M27 37L38 26H47" fill="none" stroke="#FF6A2B" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M21 43L24.6 33.1L30.9 39.4Z" fill="#FF6A2B"/>
+  <circle cx="47" cy="26" r="2.6" fill="#FF6A2B"/>
+</svg>

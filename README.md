@@ -1,4 +1,11 @@
-# Boringshot
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.svg">
+    <img src="docs/assets/logo.svg" width="128" height="128" alt="Boringshot logo">
+  </picture>
+</p>
+
+<h1 align="center">Boringshot</h1>
 
 Windows 原生截图标注工具：CAD 式多重引线（MLEADER）、常驻水印 / 遮罩、呼出动画、手写笔书法彩蛋。
 风格：**酷 · 稳健 · 迅捷 · 敏捷 · 高效**。完整规划见 [`docs/PLAN.md`](docs/PLAN.md)，工作约定见 [`CLAUDE.md`](CLAUDE.md)。
