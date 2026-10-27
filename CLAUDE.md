@@ -16,7 +16,8 @@
    ```sh
    cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build --output-on-failure
    ```
-   平台层（`app/win`）无法在 Linux 单测时，至少提供 `--smoke` 自检并在 Windows CI 中运行。
+   平台层（`app/win`）无法在 Linux 单测时，至少提供 `--smoke` 自检并在 Windows CI 中运行；
+   提交前可用 mingw-w64 交叉编译做快速语法/链接检查（`CMAKE_SYSTEM_NAME=Windows`，CI 仍以 MSVC 为准）。
 2. **Action 编译安装包默认走 Release**：`.github/workflows/build.yml` 的 `build_type` 默认 `Release`；
    CMake 单配置生成器未指定时也默认 `Release`。
 3. **自带运行时**：MSVC 使用 `/MT` 静态 CRT（`CMAKE_MSVC_RUNTIME_LIBRARY`），用户无需安装 VC++ Redist。
@@ -26,7 +27,7 @@
 
 | 路径 | 内容 |
 |---|---|
-| `core/` | 平台无关核心：MLEADER 几何与交互状态机、命令栈、水印模板与平铺 |
-| `app/win/` | Win32 常驻外壳：单例、托盘、全局热键、穿透水印覆盖层（D2D + UpdateLayeredWindow） |
+| `core/` | 平台无关核心：MLEADER、命令栈、标注文档、选区/手柄/窗口拾取/工具栏布局、取色格式、贴图缩放、水印 |
+| `app/win/` | Win32 外壳：托盘/热键/单例、屏幕抓取、截图覆盖层、贴图窗口、水印覆盖层、gfx（D2D/DWrite/WIC/剪贴板） |
 | `tests/` | 零依赖单元测试（自带极简测试框架） |
 | `packaging/` | Inno Setup 安装脚本 |

@@ -14,6 +14,15 @@ Vec2 snapKink(Vec2 arrowTip, Vec2 kink, float stepDeg) {
     return arrowTip + Vec2{std::cos(snapped), std::sin(snapped)} * len;
 }
 
+std::optional<std::array<Vec2, 3>> arrowHeadTriangle(Vec2 from, Vec2 tip, float h, float halfWidth) {
+    const Vec2 u = normalize(tip - from);
+    if (u == Vec2{}) return std::nullopt;
+    const float len = std::min(h, length(tip - from));
+    const Vec2 v{-u.y, u.x};
+    const Vec2 base = tip - u * len;
+    return std::array<Vec2, 3>{tip, base + v * halfWidth, base - v * halfWidth};
+}
+
 MLeaderLayout layoutMLeader(const MLeaderInput& in, const MLeaderGeometry& g) {
     MLeaderLayout out;
     out.arrowTip = in.arrowTip;
@@ -42,15 +51,7 @@ MLeaderLayout layoutMLeader(const MLeaderInput& in, const MLeaderGeometry& g) {
         out.textRect.left = out.textRect.right - textW;
     }
 
-    // Arrowhead B - hU ± wV, U pointing from kink toward the tip.
-    const Vec2 u = normalize(in.arrowTip - in.kink);
-    if (u != Vec2{}) {
-        const float h = std::min(g.arrowSize, length(in.arrowTip - in.kink));
-        const Vec2 v{-u.y, u.x};
-        const Vec2 base = in.arrowTip - u * h;
-        out.arrowHead = std::array<Vec2, 3>{in.arrowTip, base + v * g.arrowHalfWidth,
-                                            base - v * g.arrowHalfWidth};
-    }
+    out.arrowHead = arrowHeadTriangle(in.kink, in.arrowTip, g.arrowSize, g.arrowHalfWidth);
     return out;
 }
 

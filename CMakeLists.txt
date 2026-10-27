@@ -27,7 +27,11 @@ endif()
 add_library(boringshot_core STATIC
   core/src/mleader.cpp
   core/src/command_stack.cpp
-  core/src/watermark.cpp)
+  core/src/watermark.cpp
+  core/src/selection.cpp
+  core/src/color.cpp
+  core/src/annotation.cpp
+  core/src/pin.cpp)
 target_include_directories(boringshot_core PUBLIC core/include)
 target_link_libraries(boringshot_core PRIVATE bs_warnings)
 
@@ -37,7 +41,9 @@ if(BORINGSHOT_BUILD_TESTS)
     tests/test_main.cpp
     tests/test_mleader.cpp
     tests/test_command_stack.cpp
-    tests/test_watermark.cpp)
+    tests/test_watermark.cpp
+    tests/test_selection.cpp
+    tests/test_annotation.cpp)
   target_link_libraries(boringshot_tests PRIVATE boringshot_core bs_warnings)
   add_test(NAME core COMMAND boringshot_tests)
 endif()
@@ -45,14 +51,21 @@ endif()
 if(WIN32)
   add_executable(boringshot WIN32
     app/win/main.cpp
+    app/win/gfx.cpp
+    app/win/capture.cpp
+    app/win/capture_window.cpp
+    app/win/pin_window.cpp
     app/win/watermark_overlay.cpp)
   target_compile_definitions(boringshot PRIVATE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00
     BORINGSHOT_VERSION="${PROJECT_VERSION}")
   target_link_libraries(boringshot PRIVATE boringshot_core bs_warnings
-    d2d1 dwrite shell32 user32 gdi32 advapi32)
+    d2d1 dwrite windowscodecs ole32 shell32 user32 gdi32 advapi32 comdlg32 dwmapi imm32)
+  if(MINGW)  # cross-compile sanity builds (CI ships MSVC)
+    target_link_options(boringshot PRIVATE -municode -static)
+  endif()
   if(BORINGSHOT_BUILD_TESTS)
-    # Platform layer self-check: create overlay, render once, tear down.
+    # Platform self-check: watermark, screen grab, capture UI + composite, pin.
     add_test(NAME win_smoke COMMAND boringshot --smoke)
   endif()
 

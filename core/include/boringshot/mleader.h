@@ -37,6 +37,10 @@ struct MLeaderLayout {
     std::optional<std::array<Vec2, 3>> arrowHead;
 };
 
+// Triangle {tip, base1, base2} = B - hU ± wV with U from `from` toward `tip`;
+// h is clamped to the segment length. Empty for a zero-length segment.
+std::optional<std::array<Vec2, 3>> arrowHeadTriangle(Vec2 from, Vec2 tip, float h, float halfWidth);
+
 // Rotate (kink - tip) to the nearest multiple of stepDeg, preserving length.
 Vec2 snapKink(Vec2 arrowTip, Vec2 kink, float stepDeg);
 
@@ -52,6 +56,7 @@ public:
     explicit MLeaderTool(MLeaderGeometry g = {}) : geometry_(g) {}
 
     Phase phase() const { return phase_; }
+    const MLeaderInput& input() const { return input_; }
     void setSnap(bool on) { snap_ = on; }
 
     void pointerMove(Vec2 p);

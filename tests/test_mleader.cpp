@@ -100,6 +100,8 @@ TEST(tool_walks_three_phases) {
     tool.click({300, 0});
     CHECK(tool.phase() == MLeaderTool::Phase::Editing);
     CHECK(tool.layout()->align == TextAlign::Left);
+    CHECK((tool.input().textAnchor == Vec2{300, 0}));
+    CHECK((tool.input().arrowTip == Vec2{0, 0}));
 
     tool.click({0, 0});  // ignored while editing
     CHECK(tool.phase() == MLeaderTool::Phase::Editing);
