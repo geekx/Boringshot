@@ -16,6 +16,7 @@
 
 #include "capture_window.h"
 #include "pin_window.h"
+#include "resource.h"
 #include "settings.h"
 #include "settings_dialog.h"
 #include "watermark_overlay.h"
@@ -47,6 +48,13 @@ bool g_captureClosed = false;
 std::vector<std::unique_ptr<PinWindow>> g_pins;
 bs::Config g_config;
 SettingsDialog g_settings;
+HICON g_trayIcon = nullptr;
+
+// App icon at the DPI-scaled size of `metric` (SM_CXSMICON for the tray); nullptr if missing.
+HICON loadAppIcon(HINSTANCE instance, int metric) {
+    const int px = GetSystemMetricsForDpi(metric, GetDpiForSystem());
+    return static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_BORINGSHOT), IMAGE_ICON, px, px, 0));
+}
 
 void addTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid{};
@@ -55,7 +63,8 @@ void addTrayIcon(HWND hwnd) {
     nid.uID = kTrayId;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = kTrayMessage;
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!g_trayIcon) g_trayIcon = loadAppIcon(g_instance, SM_CXSMICON);
+    nid.hIcon = g_trayIcon ? g_trayIcon : LoadIconW(nullptr, IDI_APPLICATION);
     const std::wstring tip = L"Boringshot " BORINGSHOT_VERSION L" · " + bs::formatHotkey(g_config.capture) + L" 截图";
     wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -243,6 +252,14 @@ void smokeLog(const std::wstring& step) {
 // overlay UI, composite, pin, watermark) without user input, then exit.
 // Non-zero = which step failed.
 int runSmoke(HINSTANCE instance) {
+    smokeLog(L"icon");
+    HICON small = loadAppIcon(instance, SM_CXSMICON);
+    HICON large = loadAppIcon(instance, SM_CXICON);
+    const bool iconOk = small && large;
+    if (small) DestroyIcon(small);
+    if (large) DestroyIcon(large);
+    if (!iconOk) return 11;
+
     smokeLog(L"settings");
     {
         constexpr wchar_t kSmokeKey[] = L"Software\\Boringshot.Smoke";
@@ -349,6 +366,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = hostProc;
     wc.hInstance = instance;
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_BORINGSHOT));
     wc.lpszClassName = kHostClass;
     RegisterClassExW(&wc);
     // Hidden top-level (not HWND_MESSAGE) so it receives TaskbarCreated broadcasts.

@@ -66,7 +66,8 @@ if(WIN32)
     app/win/pin_window.cpp
     app/win/settings.cpp
     app/win/settings_dialog.cpp
-    app/win/watermark_overlay.cpp)
+    app/win/watermark_overlay.cpp
+    app/win/boringshot.rc)
   target_compile_definitions(boringshot PRIVATE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00
     BORINGSHOT_VERSION="${PROJECT_VERSION}")

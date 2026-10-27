@@ -30,4 +30,4 @@
 | `core/` | 平台无关核心：MLEADER、命令栈、标注文档与 CMF 样式、形状拾取/关节编辑、选区/窗口拾取/工具栏布局、马赛克/模糊、动画曲线、配置/热键解析、取色、贴图缩放、水印 |
 | `app/win/` | Win32 外壳：托盘/热键/单例、设置窗口与注册表存储、屏幕抓取（GDI / WGC）、截图覆盖层、贴图窗口、水印覆盖层、gfx（D2D/DWrite/WIC/剪贴板） |
 | `tests/` | 零依赖单元测试（自带极简测试框架） |
-| `packaging/` | Inno Setup 安装脚本 |
+| `packaging/` | Inno Setup 安装脚本；`make_icon.py` 由 logo 几何生成 `app/win/boringshot.ico`（需 Pillow，产物已提交） |

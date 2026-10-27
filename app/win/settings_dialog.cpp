@@ -7,6 +7,8 @@
 #include <cwchar>
 #include <string>
 
+#include "resource.h"
+
 namespace {
 
 constexpr wchar_t kClassName[] = L"Boringshot.Settings";
@@ -71,7 +73,10 @@ bool SettingsDialog::open(HINSTANCE instance, const bs::Config& current, ApplyFn
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_BORINGSHOT));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_BORINGSHOT), IMAGE_ICON,
+                                               GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()),
+                                               GetSystemMetricsForDpi(SM_CYSMICON, GetDpiForSystem()), 0));
     wc.lpszClassName = kClassName;
     RegisterClassExW(&wc);
 
